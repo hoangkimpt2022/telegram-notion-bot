@@ -1,0 +1,3 @@
+__pycache__/
+*.pyc
+notion_assistant_actions.log
