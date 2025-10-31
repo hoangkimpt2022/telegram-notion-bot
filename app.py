@@ -2,19 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 app.py - Webhook version for Render deployment
-- Updated: ensures oldest->newest ordering, summary counts, no Notion links in Telegram,
-  verifies patch results, WAIT_CONFIRM behaviour preserved.
-  - When keyword only (no count), shows unchecked/checked counts with emoji, even if unchecked=0.
-  - Preview prompt: "Gửi số (ví dụ 1-7)".
-  - If single number N in selection, treat as 1-N (e.g., "3" -> 1,2,3).
-  - For archive: always show all matching pages (checked + unchecked), with counts.
-  - Undo specific to keyword, e.g., "linh undo".
+Full integrated version (Telegram webhook + Notion helpers + handlers).
 """
 import os, time, json, requests, random, traceback
 from flask import Flask, request, Response
 from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
 from datetime import datetime, timezone
+import threading
 
 app = Flask(__name__)
 
@@ -24,9 +19,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 # Search property: empty -> search title
-SEARCH_PROPERTY = "" # "" means search title (Name)
-CHECKBOX_PROP = "Đã Góp" # checkbox property to set True
-DATE_PROP_NAME = "Ngày Góp" # date property to use for sorting (if exists)
+SEARCH_PROPERTY = ""  # "" means search title (Name)
+CHECKBOX_PROP = "Đã Góp"  # checkbox property to set True
+DATE_PROP_NAME = "Ngày Góp"  # date property to use for sorting (if exists)
 # Operational settings
 WAIT_CONFIRM = 120
 NOTION_PAGE_SIZE = 100
@@ -35,22 +30,32 @@ PATCH_DELAY = 0.45
 MAX_RETRIES = 3
 RETRY_SLEEP = 1.0
 LOG_PATH = Path("notion_assistant_actions.log")
-BASE_TELE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+
+if TELEGRAM_TOKEN:
+    BASE_TELE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+else:
+    BASE_TELE_URL = None
+
 NOTION_HEADERS = {
-    "Authorization": f"Bearer {NOTION_TOKEN}",
+    "Authorization": f"Bearer {NOTION_TOKEN}" if NOTION_TOKEN else "",
     "Notion-Version": "2022-06-28",
     "Content-Type": "application/json",
 }
 # ---------------------------------------------------------
 pending_confirm: Dict[str, Dict[str, Any]] = {}
+
 # ---------------- Helpers / Utils ----------------
-def normalize_notion_id(maybe_id: str) -> str:
+def normalize_notion_id(maybe_id: Optional[str]) -> Optional[str]:
+    if not maybe_id:
+        return None
     s = (maybe_id or "").strip()
     s = s.replace("-", "")
     if len(s) == 32:
         return f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:32]}"
     return maybe_id
+
 NOTION_DATABASE_ID = normalize_notion_id(NOTION_DATABASE_ID)
+
 def log_action(entry: dict):
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -58,9 +63,14 @@ def log_action(entry: dict):
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as e:
         print("Log write error:", e)
+
 def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat()
+
 def send_telegram(chat_id: str, text: str) -> bool:
+    if not BASE_TELE_URL:
+        print("No TELEGRAM_TOKEN set; cannot send message.")
+        return False
     try:
         r = requests.post(BASE_TELE_URL + "/sendMessage",
                           data={"chat_id": chat_id, "text": text}, timeout=15)
@@ -69,8 +79,11 @@ def send_telegram(chat_id: str, text: str) -> bool:
     except Exception as e:
         print("Telegram send error:", e)
         return False
+
 # ---------------- Notion helpers ----------------
 def notion_query_all(db_id: str) -> List[dict]:
+    if not db_id:
+        return []
     url = f"https://api.notion.com/v1/databases/{db_id}/query"
     results = []
     payload = {"page_size": NOTION_PAGE_SIZE}
@@ -87,12 +100,14 @@ def notion_query_all(db_id: str) -> List[dict]:
         if not next_cursor:
             break
     return results
+
 def notion_get_page(page_id: str) -> dict:
     url = f"https://api.notion.com/v1/pages/{page_id}"
     r = requests.get(url, headers=NOTION_HEADERS, timeout=15)
     if r.status_code != 200:
         raise RuntimeError(f"Notion get page error {r.status_code}: {r.text}")
     return r.json()
+
 def notion_patch_page_properties(page_id: str, properties: dict) -> Tuple[bool, str]:
     url = f"https://api.notion.com/v1/pages/{page_id}"
     body = {"properties": properties}
@@ -111,6 +126,7 @@ def notion_patch_page_properties(page_id: str, properties: dict) -> Tuple[bool, 
             print("Notion patch exception:", err)
             time.sleep(RETRY_SLEEP * attempt)
     return False, err
+
 def notion_archive_page(page_id: str) -> Tuple[bool, str]:
     url = f"https://api.notion.com/v1/pages/{page_id}"
     body = {"archived": True}
@@ -129,6 +145,7 @@ def notion_archive_page(page_id: str) -> Tuple[bool, str]:
             print("Notion archive exception:", err)
             time.sleep(RETRY_SLEEP * attempt)
     return False, err
+
 def notion_archive_page_revert(page_id: str) -> Tuple[bool,str]:
     url = f"https://api.notion.com/v1/pages/{page_id}"
     body = {"archived": False}
@@ -145,11 +162,13 @@ def notion_archive_page_revert(page_id: str) -> Tuple[bool,str]:
             err = str(e)
             time.sleep(RETRY_SLEEP * attempt)
     return False, err
+
 # ---------------- Extractors ----------------
 def _join_plain_text_array(arr):
     if not arr:
         return ""
     return "".join([x.get("plain_text","") for x in arr if isinstance(x, dict)]).strip()
+
 def extract_prop_text(props: dict, name: str) -> str:
     key = None
     for k in props.keys():
@@ -185,11 +204,13 @@ def extract_prop_text(props: dict, name: str) -> str:
     except Exception:
         pass
     return str(prop).strip()
+
 def extract_title_from_props(props: dict) -> str:
     for k,v in props.items():
         if isinstance(v, dict) and v.get("type") == "title":
             return _join_plain_text_array(v.get("title", []))
     return extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
+
 def find_date_for_page(p: dict) -> Optional[str]:
     props = p.get("properties", {})
     if DATE_PROP_NAME:
@@ -204,6 +225,7 @@ def find_date_for_page(p: dict) -> Optional[str]:
                 if start:
                     return start
     return p.get("created_time")
+
 def extract_date_from_prop(props: dict, prop_name: str) -> Optional[str]:
     key = None
     for k in props.keys():
@@ -217,6 +239,7 @@ def extract_date_from_prop(props: dict, prop_name: str) -> Optional[str]:
         if isinstance(dt, dict):
             return dt.get("start")
     return None
+
 def is_checked(props: dict, checkbox_name: str) -> Optional[bool]:
     key = None
     for k in props.keys():
@@ -228,6 +251,7 @@ def is_checked(props: dict, checkbox_name: str) -> Optional[bool]:
     if isinstance(v, dict) and v.get("type") == "checkbox":
         return bool(v.get("checkbox"))
     return None
+
 # ---------------- Search & Sort ----------------
 def parse_date_or_max(s: str):
     if not s:
@@ -242,15 +266,11 @@ def parse_date_or_max(s: str):
             return datetime.fromtimestamp(float(s))
         except:
             return datetime.max.replace(tzinfo=timezone.utc)
+
 def find_matching_unchecked_pages(db_id: str, keyword: str, limit: Optional[int]=None) -> List[Tuple[str,str,str]]:
-    """
-    Return list of (page_id, preview, date_iso) for pages that match keyword and are unchecked.
-    Sorted by date ascending (oldest first).
-    """
     keyword = (keyword or "").strip().lower()
-    if not keyword:
+    if not keyword or not db_id:
         return []
-    # We'll use fetch-all (reliable). Could be optimized with filter API if desired.
     pages = notion_query_all(db_id)
     matches = []
     for p in pages:
@@ -266,19 +286,12 @@ def find_matching_unchecked_pages(db_id: str, keyword: str, limit: Optional[int]
             date_iso = find_date_for_page(p) or ""
             preview = title or auto_text or pid
             matches.append((pid, preview, date_iso))
-            if limit and len(matches) >= limit:
-                # keep collecting to ensure sorting correctness, but we can break if satisfied
-                pass
-    # sort by date asc, then title
     matches_sorted = sorted(matches, key=lambda it: (parse_date_or_max(it[2]), it[1].lower()))
     return matches_sorted[:limit] if limit else matches_sorted
+
 def find_matching_all_pages(db_id: str, keyword: str, limit: Optional[int]=None) -> List[Tuple[str,str,str]]:
-    """
-    Return list of (page_id, preview, date_iso) for all pages that match keyword (checked + unchecked).
-    Sorted by date ascending (oldest first).
-    """
     keyword = (keyword or "").strip().lower()
-    if not keyword:
+    if not keyword or not db_id:
         return []
     pages = notion_query_all(db_id)
     matches = []
@@ -294,12 +307,10 @@ def find_matching_all_pages(db_id: str, keyword: str, limit: Optional[int]=None)
             matches.append((pid, preview, date_iso))
     matches_sorted = sorted(matches, key=lambda it: (parse_date_or_max(it[2]), it[1].lower()))
     return matches_sorted[:limit] if limit else matches_sorted
+
 def find_matching_pages_counts(db_id: str, keyword: str) -> Tuple[int,int]:
-    """
-    Count matched pages: returns (unchecked_count, checked_count)
-    """
     keyword = (keyword or "").strip().lower()
-    if not keyword:
+    if not keyword or not db_id:
         return 0,0
     pages = notion_query_all(db_id)
     unchecked = 0
@@ -316,6 +327,7 @@ def find_matching_pages_counts(db_id: str, keyword: str) -> Tuple[int,int]:
             else:
                 unchecked += 1
     return unchecked, checked
+
 # ---------------- Commands & Handlers ----------------
 def parse_user_command(text: str) -> Tuple[str, Optional[int], str]:
     text = (text or "").strip()
@@ -337,16 +349,14 @@ def parse_user_command(text: str) -> Tuple[str, Optional[int], str]:
         parts = parts[:-1]
     keyword = " ".join(parts).strip()
     return keyword, n, action
+
 def build_preview_lines(matches: List[Tuple[str,str,str]]) -> List[str]:
-    """
-    Build lines for telegram preview WITHOUT notion links.
-    Format: "1. [YYYY-MM-DD] Preview"
-    """
     lines = []
     for i,(pid,pre,d) in enumerate(matches, start=1):
         date_part = d[:10] if d else "-"
         lines.append(f"{i}. [{date_part}] {pre}")
     return lines
+
 def send_long_text(chat_id: str, text: str):
     limit = 3800
     parts = []
@@ -361,11 +371,13 @@ def send_long_text(chat_id: str, text: str):
     for p in parts:
         send_telegram(chat_id, p)
         time.sleep(0.2)
+
 def find_prop_key_case_insensitive(props: dict, name: str) -> Optional[str]:
     for k in props.keys():
         if k.lower() == name.lower():
             return k
     return None
+
 def handle_command_mark(chat_id: str, keyword: str, count: Optional[int], orig_cmd: str):
     # first get counts
     unchecked_count, checked_count = find_matching_pages_counts(NOTION_DATABASE_ID, keyword)
@@ -426,6 +438,7 @@ def handle_command_mark(chat_id: str, keyword: str, count: Optional[int], orig_c
         return
     # no count -> show preview + counts, even if unchecked=0
     matches_full = find_matching_unchecked_pages(NOTION_DATABASE_ID, keyword, limit=MAX_PREVIEW)
+    # <-- HERE is the header you asked about -->
     header = f"🔎 Khách hàng: '{keyword}'\n" \
              f"✅ Đã tích: {checked_count}\n" \
              f"🟡 Chưa tích: {unchecked_count}\n\n"
@@ -442,6 +455,7 @@ def handle_command_mark(chat_id: str, keyword: str, count: Optional[int], orig_c
         "expires": time.time() + WAIT_CONFIRM,
         "orig_command": orig_cmd
     }
+
 def handle_command_archive(chat_id: str, keyword: str, count: Optional[int], orig_cmd: str):
     unchecked_count, checked_count = find_matching_pages_counts(NOTION_DATABASE_ID, keyword)
     limit = count if count and count > 0 else MAX_PREVIEW
@@ -490,6 +504,7 @@ def handle_command_archive(chat_id: str, keyword: str, count: Optional[int], ori
         "expires": time.time() + WAIT_CONFIRM,
         "orig_command": orig_cmd
     }
+
 def parse_selection_text(sel_text: str, total: int) -> List[int]:
     s = sel_text.strip().lower()
     if not s:
@@ -520,6 +535,7 @@ def parse_selection_text(sel_text: str, total: int) -> List[int]:
             except:
                 continue
     return sorted(res)
+
 def process_pending_selection(chat_id: str, text: str):
     pc = pending_confirm.get(str(chat_id))
     if not pc:
@@ -616,6 +632,7 @@ def process_pending_selection(chat_id: str, text: str):
         send_telegram(chat_id, "Pending type không nhận diện.")
         del pending_confirm[str(chat_id)]
         return
+
 def undo_last(chat_id: str, op_id: Optional[str], keyword: Optional[str] = None):
     if not LOG_PATH.exists():
         send_telegram(chat_id, "Không có log để undo.")
@@ -680,14 +697,94 @@ def undo_last(chat_id: str, op_id: Optional[str], keyword: Optional[str] = None)
     else:
         send_telegram(chat_id, "Không thể undo cho loại op này.")
         return
+
+# ---------------- Message Handler ----------------
+def handle_incoming_message(chat_id: str, text: str):
+    """
+    Central entrypoint for incoming Telegram messages.
+    Decides: pending selection -> process_pending_selection
+             /cancel -> cancel
+             undo command -> undo_last
+             archive/mark commands -> call respective handlers
+    """
+    try:
+        # optional: restrict by TELEGRAM_CHAT_ID if provided
+        if TELEGRAM_CHAT_ID and str(chat_id) != str(TELEGRAM_CHAT_ID):
+            send_telegram(chat_id, "⚠️ Bot chưa được phép nhận lệnh từ chat này.")
+            return
+
+        # trim
+        raw = (text or "").strip()
+        if not raw:
+            send_telegram(chat_id, "Vui lòng gửi lệnh hoặc từ khoá.")
+            return
+
+        low = raw.lower().strip()
+
+        # If there is a pending confirm, and input looks like selection or 'all' or numbers -> process selection
+        if str(chat_id) in pending_confirm:
+            # allow explicit cancel
+            if low in ("/cancel", "cancel", "hủy", "huy"):
+                del pending_confirm[str(chat_id)]
+                send_telegram(chat_id, "Đã hủy thao tác đang chờ.")
+                return
+            # If text seems like selection input (numbers, ranges, 'all') -> process
+            if any(ch.isdigit() for ch in low) or low in ("all", "tất cả", "tat ca", "none"):
+                process_pending_selection(chat_id, raw)
+                return
+            # otherwise fall-through to treat as new command (user typed new keyword)
+            # We'll cancel old pending
+            del pending_confirm[str(chat_id)]
+            # continue to parse as new command
+
+        # cancel command explicit
+        if low in ("/cancel", "cancel", "hủy", "huy"):
+            send_telegram(chat_id, "Không có thao tác đang chờ. /cancel ignored.")
+            return
+
+        # parse user command
+        keyword, count, action = parse_user_command(raw)
+
+        # if undo action
+        if action == "undo":
+            # keyword may be provided to narrow undo
+            undo_last(chat_id, None, keyword if keyword else None)
+            return
+
+        # if archive action
+        if action == "archive":
+            # run archive handler (this will either preview or immediately archive if count provided)
+            # run in background thread because may block
+            threading.Thread(target=handle_command_archive, args=(chat_id, keyword, count, raw), daemon=True).start()
+            return
+
+        # default mark action
+        threading.Thread(target=handle_command_mark, args=(chat_id, keyword, count, raw), daemon=True).start()
+        return
+
+    except Exception as e:
+        print("handle_incoming_message exception:", e)
+        traceback.print_exc()
+        try:
+            send_telegram(chat_id, f"❌ Lỗi xử lý: {e}")
+        except:
+            pass
+
 # ---------------- Webhook Handler ----------------
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    update = request.get_json()
+    update = request.get_json(silent=True)
     if update and 'message' in update:
-        chat_id = str(update['message']['chat']['id'])
-        text = update['message'].get('text', '')
-        handle_incoming_message(chat_id, text)
+        try:
+            chat_id = str(update['message']['chat']['id'])
+            text = update['message'].get('text', '')
+            handle_incoming_message(chat_id, text)
+        except Exception as e:
+            print("Webhook handling exception:", e)
+            traceback.print_exc()
+            # return 200 to avoid repeated retry storms; log details
+            return Response('OK', status=200)
+    # respond 200 to all Telegram callbacks
     return Response('OK', status=200)
 
 if __name__ == '__main__':
