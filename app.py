@@ -544,13 +544,13 @@ def handle_command_mark(chat_id: str, keyword: str, count: Optional[int], orig_c
             return
         # no count -> preview + counts
         matches_full = find_matching_unchecked_pages(NOTION_DATABASE_ID, keyword, limit=MAX_PREVIEW)
-        header = f"🔎 Khách hàng: '{keyword}'\n" \
+        header = f"🔎 : '{keyword}'\n" \
                  f"✅ Đã tích: {checked_count}\n" \
                  f"🟡 Chưa tích: {unchecked_count}\n\n"
         if not matches_full:
             send_telegram(chat_id, header + "Không còn mục chưa tích để hiển thị.")
             return
-        header += f"📤 Gửi số (ví dụ 1-7) trong {WAIT_CONFIRM}s để chọn, hoặc /cancel.\n"
+        header += f"📤 Gửi số ( 📤 /1  📤 /2  📤 /3  📤 /4 📤 /5 📤 /6 📤 /7 ) trong {WAIT_CONFIRM}s để chọn, hoặc /cancel.\n"
         preview_lines = build_preview_lines(matches_full)
         send_long_text(chat_id, header + "\n".join(preview_lines))
         pending_confirm[str(chat_id)] = {
