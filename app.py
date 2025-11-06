@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-app.py - Complete webhook bot (merged + DAO relation fix)
-Behavior:
- - "name đáo" -> search in TARGET_NOTION_DATABASE_ID (dao data)
- - preview total/per_day/dates -> wait 'ok'
- - on 'ok' -> create pages in NOTION_DATABASE_ID (calendar DB)
-   with properties:
-     - Title = "{name} — đáo YYYY-MM-DD"
-     - DATE_PROP (Ngày Góp) = date
-     - CHECKBOX_PROP (Đã Góp) = True
-     - "Lịch G" (relation) -> link to source page id (source in TARGET_NOTION_DATABASE_ID)
-     - "Source Page" (rich_text) for trace
- - idempotency: skip if page with same name token + date exists in NOTION_DATABASE_ID
- - robust Notion retries, logging, and Telegram confirmation flow
+app.py - Complete Telegram<->Notion bot
+Features:
+ - Search / cache Notion DB
+ - mark (checkbox), archive, undo
+ - DAO ("<name> đáo") flow:
+    * search in TARGET_NOTION_DATABASE_ID (dao data)
+    * require emoji ✅ in check column (default "✅Đáo/thối")
+    * total <- numeric from that column
+    * per_day <- numeric from per-day candidates
+    * days = ceil(total / per_day)
+    * preview dates starting tomorrow
+    * on 'ok' create pages into NOTION_DATABASE_ID with relation Lịch G -> source page
 """
 import os
 import time
@@ -32,25 +31,26 @@ from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
 
-# ---------------- CONFIG (from env) ----------------
+# ---------------- CONFIG (env) ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # optional restrict
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")  # calendar DB (where to create pages)
-TARGET_NOTION_DATABASE_ID = os.getenv("TARGET_NOTION_DATABASE_ID")  # dao data DB (where to search)
+TARGET_NOTION_DATABASE_ID = os.getenv("TARGET_NOTION_DATABASE_ID")  # dao DB (where to search)
 
-SEARCH_PROPERTY = ""  # "" means search title (Name)
+SEARCH_PROPERTY = ""  # optional: extra searchable property
 CHECKBOX_PROP = os.getenv("CHECKBOX_PROP", "Đã Góp")
 DATE_PROP_NAME = os.getenv("DATE_PROP_NAME", "Ngày Góp")
+LICH_G_PROP = os.getenv("LICH_G_PROP", "Lịch G")  # relation property name in calendar DB
 
-# DAO config
+# DAO defaults: total from "✅Đáo/thối"
 DAO_CONFIRM_TIMEOUT = int(os.getenv("DAO_CONFIRM_TIMEOUT", 120))
-DAO_MAX_DAYS = int(os.getenv("DAO_MAX_DAYS", 30))
-DAO_TOTAL_FIELD_CANDIDATES = os.getenv("DAO_TOTAL_FIELDS", "✅Đáo/thối,total,pre,tong,Σ").split(",")
-DAO_PERDAY_FIELD_CANDIDATES = os.getenv("DAO_PERDAY_FIELDS", "G ngày,per_day,perday,trước /ngày").split(",")
-DAO_CHECKFIELD_CANDIDATES = os.getenv("DAO_CHECK_FIELDS", "Đáo/Thối,Đáo,Đáo Thối,dao,daothoi").split(",")
+DAO_MAX_DAYS = int(os.getenv("DAO_MAX_DAYS", 60))
+DAO_TOTAL_FIELD_CANDIDATES = os.getenv("DAO_TOTAL_FIELDS", "✅Đáo/thối").split(",")
+DAO_PERDAY_FIELD_CANDIDATES = os.getenv("DAO_PERDAY_FIELDS", "G ngày,per_day,perday,phần/ngày,Trước,Truoc").split(",")
+DAO_CHECKFIELD_CANDIDATES = os.getenv("DAO_CHECK_FIELDS", "✅Đáo/thối,Đáo/Thối,Đáo,Đáo Thối").split(",")
 
-# Operational settings
+# operational
 WAIT_CONFIRM = int(os.getenv("WAIT_CONFIRM", 120))
 NOTION_PAGE_SIZE = int(os.getenv("NOTION_PAGE_SIZE", 100))
 MAX_PREVIEW = int(os.getenv("MAX_PREVIEW", 100))
@@ -74,21 +74,18 @@ NOTION_HEADERS = {
 # state
 pending_confirm: Dict[str, Dict[str, Any]] = {}
 
-# simple cache for source (calendar) DB (used by many functions)
+# cache for calendar DB (NOTION_DATABASE_ID)
 _NOTION_CACHE = {"ts": 0.0, "pages": [], "tokens_map": {}, "preview_map": {}, "props_map": {}}
 _cache_lock = threading.Lock()
-
 
 # ---------------- Helpers ----------------
 def normalize_notion_id(maybe_id: Optional[str]) -> Optional[str]:
     if not maybe_id:
         return None
-    s = (maybe_id or "").strip()
-    s = s.replace("-", "")
+    s = (maybe_id or "").strip().replace("-", "")
     if len(s) == 32:
         return f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:32]}"
     return maybe_id
-
 
 NOTION_DATABASE_ID = normalize_notion_id(NOTION_DATABASE_ID)
 TARGET_NOTION_DATABASE_ID = normalize_notion_id(TARGET_NOTION_DATABASE_ID) if TARGET_NOTION_DATABASE_ID else None
@@ -137,8 +134,7 @@ def strip_accents(s: str) -> str:
     if not s:
         return ""
     s = unicodedata.normalize("NFD", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-    return s
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
 
 def normalize_and_tokenize(s: str) -> List[str]:
     if not s:
@@ -168,7 +164,6 @@ def notion_query_all_raw(db_id: str) -> List[dict]:
     return results
 
 def _refresh_notion_cache_if_needed():
-    """Cache for NOTION_DATABASE_ID (calendar DB) used by many existing flows."""
     with _cache_lock:
         now = time.time()
         if now - _NOTION_CACHE["ts"] <= NOTION_CACHE_TTL and _NOTION_CACHE["pages"]:
@@ -195,7 +190,6 @@ def notion_get_page(page_id: str) -> dict:
     if r.status_code != 200:
         raise RuntimeError(f"Notion get page error {r.status_code}: {r.text}")
     page = r.json()
-    # update cache entry if it's in calendar db
     with _cache_lock:
         pid = page.get("id")
         props = page.get("properties", {})
@@ -215,6 +209,7 @@ def notion_patch_page_properties(page_id: str, properties: dict) -> Tuple[bool, 
         try:
             r = requests.patch(url, headers=NOTION_HEADERS, json=body, timeout=15)
             if r.status_code in (200, 201):
+                invalidate_notion_cache(page_id)
                 return True, "OK"
             else:
                 err = f"{r.status_code}: {r.text}"
@@ -234,6 +229,7 @@ def notion_archive_page(page_id: str) -> Tuple[bool, str]:
         try:
             r = requests.patch(url, headers=NOTION_HEADERS, json=body, timeout=15)
             if r.status_code in (200, 201):
+                invalidate_notion_cache(page_id)
                 return True, "OK"
             else:
                 err = f"{r.status_code}: {r.text}"
@@ -253,6 +249,7 @@ def notion_archive_page_revert(page_id: str) -> Tuple[bool, str]:
         try:
             r = requests.patch(url, headers=NOTION_HEADERS, json=body, timeout=15)
             if r.status_code in (200, 201):
+                invalidate_notion_cache(page_id)
                 return True, "OK"
             else:
                 err = f"{r.status_code}: {r.text}"
@@ -271,6 +268,7 @@ def notion_create_page_in_db(db_id: str, properties: dict) -> Tuple[bool, dict]:
             r = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=20)
             if r.status_code in (200, 201):
                 created = r.json()
+                invalidate_notion_cache()
                 return True, created
             else:
                 err = {"status": r.status_code, "text": r.text}
@@ -281,6 +279,16 @@ def notion_create_page_in_db(db_id: str, properties: dict) -> Tuple[bool, dict]:
             print("Notion create exception:", err)
             time.sleep(RETRY_SLEEP * attempt)
     return False, err
+
+def invalidate_notion_cache(page_id: Optional[str] = None):
+    with _cache_lock:
+        if page_id:
+            _NOTION_CACHE["tokens_map"].pop(page_id, None)
+            _NOTION_CACHE["preview_map"].pop(page_id, None)
+            _NOTION_CACHE["props_map"].pop(page_id, None)
+            _NOTION_CACHE["pages"] = [p for p in _NOTION_CACHE["pages"] if p.get("id") != page_id]
+        else:
+            _NOTION_CACHE.update({"ts": 0.0, "pages": [], "tokens_map": {}, "preview_map": {}, "props_map": {}})
 
 # ---------------- Extractors ----------------
 def _join_plain_text_array(arr):
@@ -373,7 +381,7 @@ def is_checked(props: dict, checkbox_name: str) -> Optional[bool]:
         return bool(v.get("checkbox"))
     return None
 
-# ---------------- Matching helpers ----------------
+# ---------------- Matching & counts ----------------
 def parse_date_or_max(s: str):
     if not s:
         return datetime.max.replace(tzinfo=timezone.utc)
@@ -415,10 +423,6 @@ def find_matching_unchecked_pages(db_id: str, keyword: str, limit: Optional[int]
     return matches_sorted[:limit] if limit else matches_sorted
 
 def find_matching_all_pages_in_db(db_id: str, keyword: str, limit: Optional[int] = None) -> List[Tuple[str, str, str]]:
-    """
-    Query a given db_id (no cache) and return tuples (page_id, title, date_iso)
-    Used for DAO search in TARGET_NOTION_DATABASE_ID.
-    """
     keyword = (keyword or "").strip()
     if not keyword or not db_id:
         return []
@@ -438,7 +442,7 @@ def find_matching_all_pages_in_db(db_id: str, keyword: str, limit: Optional[int]
     return matches_sorted[:limit] if limit else matches_sorted
 
 def find_matching_all_pages(db_id: str, keyword: str, limit: Optional[int] = None) -> List[Tuple[str, str, str]]:
-    # default behavior uses cached calendar DB (NOTION_DATABASE_ID)
+    # for calendar DB searches (uses cache)
     keyword = (keyword or "").strip()
     if not keyword or not db_id:
         return []
@@ -480,19 +484,19 @@ def extract_number_from_prop(props: dict, candidate_names: List[str]) -> Optiona
     for name in candidate_names:
         val = extract_prop_text(props, name)
         if val:
-            v = val.replace(",", "").strip()
-            m = re.findall(r"-?\d+\.?\d*", v)
+            vv = str(val).replace(",", "").strip()
+            m = re.findall(r"-?\d+\.?\d*", vv)
             if m:
                 try:
                     return float(m[0])
                 except:
                     continue
-    # fallback: scan all props
-    for k, v in props.items():
+    # fallback scan
+    for k in props.keys():
         text = extract_prop_text(props, k)
         if text:
-            v = text.replace(",", "")
-            m = re.findall(r"-?\d+\.?\d*", v)
+            vv = str(text).replace(",", "").strip()
+            m = re.findall(r"-?\d+\.?\d*", vv)
             if m:
                 try:
                     return float(m[0])
@@ -505,16 +509,17 @@ def check_checkfield_has_check(props: dict, candidates: List[str]) -> bool:
         txt = extract_prop_text(props, name)
         if txt and "✅" in txt:
             return True
+    # fallback: scan all props
     for k in props.keys():
         txt = extract_prop_text(props, k)
         if txt and "✅" in txt:
             return True
     return False
 
-def build_dao_preview_text(name: str, total: float, per_day: float, days: int, start_date: datetime):
+def build_dao_preview_text_exact(name: str, total: int, per_day: int, days: int, taken_sum: int, start_date: datetime):
     lines = []
-    lines.append(f"🔔  đáo lại cho: {name}  - Tổng đáo: {int(total) if total is not None else total}")
-    lines.append(f"Lấy trước : {days} ngày {int(per_day) if per_day is not None else per_day}  | {int(total) if total is not None else total}")
+    lines.append(f"🔔  đáo lại cho: {name}  - Tổng đáo: ✅ {total}")
+    lines.append(f"Lấy trước : {days} ngày {per_day}  | {taken_sum}")
     lines.append("")
     lines.append("Danh sách ngày dự kiến tạo (bắt đầu từ ngày mai):")
     for i in range(days):
@@ -525,9 +530,6 @@ def build_dao_preview_text(name: str, total: float, per_day: float, days: int, s
     return "\n".join(lines)
 
 def notion_find_pages_by_name_and_date_in_db(db_id: str, name_token: str, date_iso: str) -> List[dict]:
-    """
-    Check existence in a given db (used for idempotency); not cached for reliability.
-    """
     pages = notion_query_all_raw(db_id)
     nt = strip_accents(name_token).lower()
     res = []
@@ -542,10 +544,6 @@ def notion_find_pages_by_name_and_date_in_db(db_id: str, name_token: str, date_i
     return res
 
 def create_pages_for_dates(user_chat: str, name: str, source_page_id: str, dates: List[datetime]) -> Tuple[List[dict], List[dict]]:
-    """
-    Create pages in NOTION_DATABASE_ID (calendar DB).
-    Set 'Lịch G' relation to source_page_id (which lives in TARGET_NOTION_DATABASE_ID).
-    """
     created = []
     skipped = []
     for dt in dates:
@@ -560,7 +558,6 @@ def create_pages_for_dates(user_chat: str, name: str, source_page_id: str, dates
         checkbox_key = CHECKBOX_PROP
         source_text = f"source_page_id: {source_page_id}"
 
-        # Build properties including relation for "Lịch G" -> link to source page id
         properties = {
             title_prop_key: {"title": [{"text": {"content": f"{name} — đáo {date_iso}"}}]},
             date_prop_key: {"date": {"start": date_iso}},
@@ -568,10 +565,9 @@ def create_pages_for_dates(user_chat: str, name: str, source_page_id: str, dates
             "Source Page": {"rich_text": [{"text": {"content": source_text}}]}
         }
 
-        # Add relation "Lịch G" if TARGET_NOTION_DATABASE_ID/source_page_id provided
+        # relation Lịch G -> source page
         if source_page_id:
-            # Relation expects {"relation": [{"id": "<page_id>"}]}
-            properties["Lịch G"] = {"relation": [{"id": source_page_id}]}
+            properties[LICH_G_PROP] = {"relation": [{"id": source_page_id}]}
 
         ok, created_obj = notion_create_page_in_db(NOTION_DATABASE_ID, properties)
         if ok:
@@ -581,13 +577,13 @@ def create_pages_for_dates(user_chat: str, name: str, source_page_id: str, dates
         time.sleep(0.25)
     return created, skipped
 
-# ---------------- Command parsing & handlers ----------------
+# ---------------- Commands: parse, mark, archive, undo ----------------
 def parse_user_command(text: str) -> Tuple[str, Optional[int], str]:
     text = (text or "").strip()
     if not text:
         return "", None, "mark"
     parts = text.lower().split()
-    if len(parts) >= 2 and parts[-1] in ("đáo", "dao", "da o", "dao"):
+    if len(parts) >= 2 and parts[-1] in ("đáo", "dao"):
         return " ".join(parts[:-1]).strip(), None, "dao"
     if parts[-1] == "undo":
         return " ".join(parts[:-1]).strip(), None, "undo"
@@ -643,7 +639,6 @@ def parse_selection_text(sel_text: str, total: int) -> List[int]:
                 continue
     return sorted(res)
 
-# --- Mark/Archive/Undo handlers kept from earlier full implementation ---
 def find_prop_key_case_insensitive(props: dict, name: str) -> Optional[str]:
     for k in props.keys():
         if k.lower() == name.lower():
@@ -679,8 +674,7 @@ def handle_command_mark(chat_id: str, keyword: str, count: Optional[int], orig_c
                     time.sleep(0.6)
                     try:
                         new_page = notion_get_page(pid)
-                        new_props = new_page.get("properties", {})
-                        if is_checked(new_props, CHECKBOX_PROP):
+                        if is_checked(new_page.get("properties", {}), CHECKBOX_PROP):
                             succeeded.append((pid, pre, d))
                         else:
                             failed.append((pid, pre, d, "verify failed"))
@@ -689,26 +683,31 @@ def handle_command_mark(chat_id: str, keyword: str, count: Optional[int], orig_c
                 else:
                     failed.append((pid, pre, d, msg))
                 time.sleep(PATCH_DELAY)
-            log_entry = {"ts": now_iso(), "type": "mark_auto", "op_id": op_id, "user_chat": chat_id,
-                         "command": orig_cmd, "keyword": keyword, "requested_count": count,
-                         "succeeded": [{"page_id": p, "preview": pr, "date": dt} for p, pr, dt in succeeded],
-                         "failed": failed}
-            log_action(log_entry)
-            res_lines = []
+            # build result message with counts updated
+            try:
+                unchecked_new, checked_new = find_matching_pages_counts(NOTION_DATABASE_ID, keyword)
+            except:
+                unchecked_new, checked_new = None, None
+            out_lines = []
             if succeeded:
-                res_lines.append(f"✅ Đã đánh dấu {len(succeeded)} mục cho '{keyword}':")
+                out_lines.append(f"✅ Đã đánh dấu {len(succeeded)} mục:")
                 for i, (p, pr, dt) in enumerate(succeeded, start=1):
-                    res_lines.append(f"{i}. [{dt[:10] if dt else '-'}] {pr}")
+                    out_lines.append(f"{i}. [{dt[:10] if dt else '-'}] {pr}")
             if failed:
-                res_lines.append("\n⚠️ Một vài mục không cập nhật:")
+                out_lines.append("\n⚠️ Một vài mục không cập nhật:")
                 for i, item in enumerate(failed, start=1):
-                    res_lines.append(f"{i}. {item}")
-            send_long_text(chat_id, "\n".join(res_lines))
+                    out_lines.append(f"{i}. {item}")
+            out_lines.append("")
+            if checked_new is not None and unchecked_new is not None:
+                out_lines.append(f"✅ Đã tích: {checked_new}")
+                out_lines.append(f"🟡 Chưa tích: {unchecked_new}")
+            send_long_text(chat_id, "\n".join(out_lines))
+            log_action({"ts": now_iso(), "type": "mark_auto", "op_id": op_id, "user_chat": chat_id, "keyword": keyword, "requested_count": count, "succeeded": [{"page_id":p,"preview":pr,"date":dt} for p,pr,dt in succeeded], "failed": failed})
             return
         matches_full = find_matching_unchecked_pages(NOTION_DATABASE_ID, keyword, limit=MAX_PREVIEW)
-        header = f"🔎 : '{keyword}'\n" \
-                 f"✅ Đã tích: {checked_count}\n" \
-                 f"🟡 Chưa tích: {unchecked_count}\n\n"
+        header = f"🔎 : '{keyword}'\n"
+        header += f"✅ Đã tích: {checked_count}\n" if checked_count is not None else ""
+        header += f"🟡 Chưa tích: {unchecked_count}\n\n" if locals().get('unchecked_count') is not None else ""
         if not matches_full:
             send_telegram(chat_id, header + "Không còn mục chưa tích để hiển thị.")
             return
@@ -746,21 +745,17 @@ def handle_command_archive(chat_id: str, keyword: str, count: Optional[int], ori
                 else:
                     failed.append((pid, pre, d, msg))
                 time.sleep(PATCH_DELAY)
-            log_entry = {"ts": now_iso(), "type": "archive_auto", "op_id": op_id, "user_chat": chat_id,
-                         "command": orig_cmd, "keyword": keyword, "requested_count": count,
-                         "succeeded": [{"page_id": p, "preview": pr, "date": dt} for p, pr, dt in succeeded],
-                         "failed": failed}
-            log_action(log_entry)
-            res_lines = []
+            out_lines = []
             if succeeded:
-                res_lines.append(f"🗑️ Đã archive {len(succeeded)} mục cho '{keyword}':")
+                out_lines.append(f"🗑️ Đã archive {len(succeeded)} mục cho '{keyword}':")
                 for i, (p, pr, dt) in enumerate(succeeded, start=1):
-                    res_lines.append(f"{i}. [{dt[:10] if dt else '-'}] {pr}")
+                    out_lines.append(f"{i}. [{dt[:10] if dt else '-'}] {pr}")
             if failed:
-                res_lines.append("\n⚠️ Một vài mục không archive:")
+                out_lines.append("\n⚠️ Một vài mục không archive:")
                 for i, item in enumerate(failed, start=1):
-                    res_lines.append(f"{i}. {item}")
-            send_long_text(chat_id, "\n".join(res_lines))
+                    out_lines.append(f"{i}. {item}")
+            send_long_text(chat_id, "\n".join(out_lines))
+            log_action({"ts": now_iso(), "type":"archive_auto", "op_id":op_id, "user_chat":chat_id, "keyword":keyword, "requested_count":count, "succeeded":[{"page_id":p,"preview":pr,"date":dt} for p,pr,dt in succeeded], "failed": failed})
             return
         preview_lines = build_preview_lines(matches)
         header = f"🔎 Khách hàng: '{keyword}'\n" \
@@ -830,11 +825,10 @@ def process_pending_selection(chat_id: str, text: str):
             else:
                 failed.append((pid, pre, d, msg))
             time.sleep(PATCH_DELAY)
-        log_entry = {"ts": now_iso(), "type": "mark_manual", "op_id": op_id, "user_chat": chat_id,
-                     "command": pc.get("orig_command"), "keyword": pc.get("keyword"),
-                     "selected": [{"page_id": p, "preview": pr, "date": dt} for p, pr, dt in succeeded],
-                     "failed": failed}
-        log_action(log_entry)
+        try:
+            unchecked_new, checked_new = find_matching_pages_counts(NOTION_DATABASE_ID, pc.get("keyword"))
+        except:
+            unchecked_new, checked_new = None, None
         out = []
         if succeeded:
             out.append(f"✅ Đã đánh dấu {len(succeeded)} mục:")
@@ -844,7 +838,12 @@ def process_pending_selection(chat_id: str, text: str):
             out.append("\n⚠️ Một vài mục không cập nhật:")
             for i, item in enumerate(failed, start=1):
                 out.append(f"{i}. {item}")
+        out.append("")
+        if checked_new is not None and unchecked_new is not None:
+            out.append(f"✅ Đã tích: {checked_new}")
+            out.append(f"🟡 Chưa tích: {unchecked_new}")
         send_long_text(chat_id, "\n".join(out))
+        log_action({"ts": now_iso(), "type":"mark_manual", "op_id":op_id, "user_chat":chat_id, "command": pc.get("orig_command"), "keyword": pc.get("keyword"), "selected":[{"page_id":p,"preview":pr,"date":dt} for p,pr,dt in succeeded], "failed": failed})
         del pending_confirm[str(chat_id)]
         return
     elif typ == "archive":
@@ -857,11 +856,6 @@ def process_pending_selection(chat_id: str, text: str):
             else:
                 failed.append((pid, pre, d, msg))
             time.sleep(PATCH_DELAY)
-        log_entry = {"ts": now_iso(), "type": "archive_manual", "op_id": op_id, "user_chat": chat_id,
-                     "command": pc.get("orig_command"), "keyword": pc.get("keyword"),
-                     "selected": [{"page_id": p, "preview": pr, "date": dt} for p, pr, dt in succeeded],
-                     "failed": failed}
-        log_action(log_entry)
         out = []
         if succeeded:
             out.append(f"🗑️ Đã archive {len(succeeded)} mục:")
@@ -872,6 +866,7 @@ def process_pending_selection(chat_id: str, text: str):
             for i, item in enumerate(failed, start=1):
                 out.append(f"{i}. {item}")
         send_long_text(chat_id, "\n".join(out))
+        log_action({"ts": now_iso(), "type":"archive_manual", "op_id":op_id, "user_chat":chat_id, "command": pc.get("orig_command"), "keyword": pc.get("keyword"), "selected":[{"page_id":p,"preview":pr,"date":dt} for p,pr,dt in succeeded], "failed": failed})
         del pending_confirm[str(chat_id)]
         return
     else:
@@ -901,7 +896,7 @@ def undo_last(chat_id: str, op_id: Optional[str], keyword: Optional[str] = None)
             if entry.get("op_id") == op_id:
                 found = entry; break
         else:
-            if entry.get("type", "").startswith("mark") or entry.get("type", "").startswith("archive"):
+            if entry.get("type", "").startswith("mark") or entry.get("type", "").startswith("archive") or entry.get("type","").startswith("dao"):
                 found = entry; break
     if not found:
         send_telegram(chat_id, "Không tìm thấy op để undo.")
@@ -922,7 +917,7 @@ def undo_last(chat_id: str, op_id: Optional[str], keyword: Optional[str] = None)
             except Exception as e:
                 failed.append((pid, str(e)))
         send_telegram(chat_id, f"♻️ Undo done. Reverted {len(reverted)} items. Failed: {len(failed)}")
-        log_action({"ts": now_iso(), "type": "undo", "user_chat": chat_id, "original_op": found.get("op_id"), "reverted": reverted, "failed": failed})
+        log_action({"ts": now_iso(), "type":"undo", "user_chat": chat_id, "original_op": found.get("op_id"), "reverted": reverted, "failed": failed})
         return
     elif typ.startswith("archive"):
         items = found.get("succeeded", []) or found.get("selected", [])
@@ -938,19 +933,35 @@ def undo_last(chat_id: str, op_id: Optional[str], keyword: Optional[str] = None)
             except Exception as e:
                 failed.append((pid, str(e)))
         send_telegram(chat_id, f"♻️ Undo archive done. Reverted {len(reverted)} items. Failed: {len(failed)}")
-        log_action({"ts": now_iso(), "type": "undo_archive", "user_chat": chat_id, "original_op": found.get("op_id"), "reverted": reverted, "failed": failed})
+        log_action({"ts": now_iso(), "type":"undo_archive", "user_chat": chat_id, "original_op": found.get("op_id"), "reverted": reverted, "failed": failed})
+        return
+    elif typ.startswith("dao"):
+        # undo created pages from dao_create log entry if present
+        items = found.get("created_ids", []) or found.get("selected", [])
+        reverted = []; failed = []
+        for pid in items:
+            try:
+                ok, msg = notion_archive_page(pid)
+                if ok:
+                    reverted.append(pid)
+                else:
+                    failed.append((pid, msg))
+                time.sleep(PATCH_DELAY)
+            except Exception as e:
+                failed.append((pid, str(e)))
+        send_telegram(chat_id, f"♻️ Undo DAO done. Archived {len(reverted)} created pages. Failed: {len(failed)}")
+        log_action({"ts": now_iso(), "type":"undo_dao", "user_chat": chat_id, "original_op": found.get("op_id"), "reverted": reverted, "failed": failed})
         return
     else:
         send_telegram(chat_id, "Không thể undo cho loại op này.")
         return
 
-# ---------------- DAO flow ----------------
+# ---------------- DAO flow handlers ----------------
 def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
     try:
         if not keyword:
             send_telegram(chat_id, "Vui lòng cung cấp tên (ví dụ: 'Trâm đáo').")
             return
-        # SEARCH in TARGET_NOTION_DATABASE_ID (dao data)
         if not TARGET_NOTION_DATABASE_ID:
             send_telegram(chat_id, "⚠️ TARGET_NOTION_DATABASE_ID chưa cấu hình.")
             return
@@ -970,37 +981,43 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
                 "orig_command": orig_cmd
             }
             return
-        # single match: use the page as source
         pid, preview, date_iso = matches[0]
         page = notion_get_page(pid)
         props = page.get("properties", {})
-        ok_check = check_checkfield_has_check(props, DAO_CHECKFIELD_CANDIDATES)
-        if not ok_check:
-            send_telegram(chat_id, f"⚠️ Page {preview} (id: {pid}) không có ✅ ở cột Đáo/Thối. Hủy thao tác.")
+
+        # require check column contains emoji ✅ strictly
+        if not check_checkfield_has_check(props, DAO_CHECKFIELD_CANDIDATES):
+            send_telegram(chat_id, f"🔴 Không thể đáo. Cột 'Đáo/Thối' chưa có emoji ✅ trên page {preview}.")
             return
+
+        # total from DAO_TOTAL_FIELD_CANDIDATES (defaults to "✅Đáo/thối")
         total = extract_number_from_prop(props, DAO_TOTAL_FIELD_CANDIDATES)
         per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
-        if per_day is None or per_day == 0:
-            send_telegram(chat_id, f"⚠️ Không tìm thấy hoặc per_day = 0. Kiểm tra cột phần/ngày trên page {preview}.")
-            return
+
         if total is None:
-            send_telegram(chat_id, f"⚠️ Không tìm thấy total trên page {preview}.")
+            send_telegram(chat_id, f"⚠️ Không tìm thấy giá trị Tổng đáo (cột '✅Đáo/thối') hợp lệ trên page {preview}.")
             return
+        if per_day is None or per_day == 0:
+            send_telegram(chat_id, f"⚠️ Không tìm thấy giá trị G/ngày (per_day) hợp lệ trên page {preview}.")
+            return
+
         days = int(math.ceil(float(total) / float(per_day)))
         if days <= 0:
             send_telegram(chat_id, f"⚠️ Kết quả days không hợp lệ: {days}.")
             return
         if days > DAO_MAX_DAYS:
-            send_telegram(chat_id, f"⚠️ Số ngày ({days}) vượt mức tối đa ({DAO_MAX_DAYS}). Hãy giảm hoặc thay đổi per_day.")
+            send_telegram(chat_id, f"⚠️ Số ngày ({days}) vượt mức tối đa ({DAO_MAX_DAYS}). Hủy.")
             return
-        preview_text = build_dao_preview_text(preview, total, per_day, days, datetime.now())
+
+        taken_sum = int(per_day * days)
+        preview_text = build_dao_preview_text_exact(preview, int(total), int(per_day), days, taken_sum, datetime.now())
         pending_confirm[str(chat_id)] = {
             "type": "dao_confirm",
             "keyword": keyword,
             "source_page_id": pid,
             "source_preview": preview,
-            "total": total,
-            "per_day": per_day,
+            "total": int(total),
+            "per_day": int(per_day),
             "days": days,
             "start_date": datetime.now().date().isoformat(),
             "expires": time.time() + DAO_CONFIRM_TIMEOUT,
@@ -1035,24 +1052,19 @@ def process_pending_selection_for_dao(chat_id: str, text: str):
         try:
             page = notion_get_page(pid)
             props = page.get("properties", {})
-            ok_check = check_checkfield_has_check(props, DAO_CHECKFIELD_CANDIDATES)
-            if not ok_check:
-                send_telegram(chat_id, f"⚠️ Page {preview} (id: {pid}) không có ✅ ở cột Đáo/Thối. Hủy thao tác.")
+            if not check_checkfield_has_check(props, DAO_CHECKFIELD_CANDIDATES):
+                send_telegram(chat_id, f"🔴 Page {preview} (id: {pid}) chưa có ✅ ở cột Đáo/Thối. Hủy.")
                 del pending_confirm[str(chat_id)]
                 return
             total = extract_number_from_prop(props, DAO_TOTAL_FIELD_CANDIDATES)
             per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
-            if per_day is None or per_day == 0:
-                send_telegram(chat_id, f"⚠️ per_day không hợp lệ trên page {preview}.")
-                del pending_confirm[str(chat_id)]
-                return
-            if total is None:
-                send_telegram(chat_id, f"⚠️ total không tìm được trên page {preview}.")
+            if total is None or per_day is None or per_day == 0:
+                send_telegram(chat_id, f"⚠️ Không đủ dữ liệu trên page {preview}.")
                 del pending_confirm[str(chat_id)]
                 return
             days = int(math.ceil(float(total) / float(per_day)))
             if days > DAO_MAX_DAYS:
-                send_telegram(chat_id, f"⚠️ Số ngày ({days}) vượt mức tối đa ({DAO_MAX_DAYS}). Hủy.")
+                send_telegram(chat_id, f"⚠️ Số ngày ({days}) vượt mức tối đa.")
                 del pending_confirm[str(chat_id)]
                 return
             pending_confirm[str(chat_id)] = {
@@ -1060,21 +1072,20 @@ def process_pending_selection_for_dao(chat_id: str, text: str):
                 "keyword": pc.get("keyword"),
                 "source_page_id": pid,
                 "source_preview": preview,
-                "total": total,
-                "per_day": per_day,
+                "total": int(total),
+                "per_day": int(per_day),
                 "days": days,
                 "start_date": datetime.now().date().isoformat(),
                 "expires": time.time() + DAO_CONFIRM_TIMEOUT,
                 "orig_command": pc.get("orig_command")
             }
-            preview_text = build_dao_preview_text(preview, total, per_day, days, datetime.now())
+            preview_text = build_dao_preview_text_exact(preview, int(total), int(per_day), days, int(per_day*days), datetime.now())
             send_long_text(chat_id, preview_text)
             return
         except Exception as e:
             send_telegram(chat_id, f"❌ Lỗi khi lấy page: {e}")
             del pending_confirm[str(chat_id)]
             return
-
     if typ == "dao_confirm":
         if text.strip().lower() in ("cancel", "/cancel", "hủy", "huy"):
             del pending_confirm[str(chat_id)]
@@ -1088,10 +1099,6 @@ def process_pending_selection_for_dao(chat_id: str, text: str):
             days = int(pcdata.get("days", 0))
             if days <= 0:
                 send_telegram(chat_id, "⚠️ Số ngày tính toán không hợp lệ.")
-                del pending_confirm[str(chat_id)]
-                return
-            if days > DAO_MAX_DAYS:
-                send_telegram(chat_id, f"⚠️ Số ngày vượt mức ({DAO_MAX_DAYS}). Hủy.")
                 del pending_confirm[str(chat_id)]
                 return
             src_pid = pcdata.get("source_page_id")
@@ -1137,12 +1144,11 @@ def process_pending_selection_for_dao(chat_id: str, text: str):
             send_telegram(chat_id, f"❌ Lỗi khi tạo pages: {e}")
             del pending_confirm[str(chat_id)]
             return
-
-    send_telegram(chat_id, "Pending type không nhận diện (expecting dao flow or mark/archive).")
+    send_telegram(chat_id, "Pending type không nhận diện (expecting dao flow).")
     del pending_confirm[str(chat_id)]
     return
 
-# ---------------- Message handler ----------------
+# ---------------- Incoming message handler & webhook ----------------
 def handle_incoming_message(chat_id: str, text: str):
     try:
         if TELEGRAM_CHAT_ID and str(chat_id) != str(TELEGRAM_CHAT_ID):
@@ -1156,7 +1162,7 @@ def handle_incoming_message(chat_id: str, text: str):
 
         low = raw.lower().strip()
 
-        # Pending flow
+        # pending selection handling
         if str(chat_id) in pending_confirm:
             if low in ("/cancel", "cancel", "hủy", "huy"):
                 del pending_confirm[str(chat_id)]
@@ -1166,6 +1172,7 @@ def handle_incoming_message(chat_id: str, text: str):
                 send_telegram(chat_id, "Đang xử lý lựa chọn...")
                 threading.Thread(target=process_pending_selection, args=(chat_id, raw), daemon=True).start()
                 return
+            # else fallthrough: cancel pending and continue
             del pending_confirm[str(chat_id)]
 
         if low in ("/cancel", "cancel", "hủy", "huy"):
@@ -1189,9 +1196,8 @@ def handle_incoming_message(chat_id: str, text: str):
             threading.Thread(target=handle_command_dao, args=(chat_id, keyword, raw), daemon=True).start()
             return
 
-        # default mark
-        send_telegram(chat_id, "Đang xử lý...")
-        threading.Thread(target=handle_command_mark, args=(chat_id, keyword, count, raw), daemon=True).start()
+        # default: fallback message
+        send_telegram(chat_id, "Lệnh không hợp lệ hoặc chưa được hỗ trợ. Sử dụng '<name> đáo' để đáo.")
     except Exception as e:
         print("handle_incoming_message exception:", e)
         traceback.print_exc()
@@ -1200,7 +1206,6 @@ def handle_incoming_message(chat_id: str, text: str):
         except:
             pass
 
-# ---------------- Webhook / health ----------------
 @app.route('/webhook', methods=['POST'])
 def webhook():
     update = request.get_json(silent=True)
