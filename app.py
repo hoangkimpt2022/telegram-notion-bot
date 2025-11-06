@@ -45,6 +45,7 @@ DATE_PROP_NAME = os.getenv("DATE_PROP_NAME", "Ngày Góp")
 DAO_CONFIRM_TIMEOUT = int(os.getenv("DAO_CONFIRM_TIMEOUT", 120))
 DAO_MAX_DAYS = int(os.getenv("DAO_MAX_DAYS", 30))
 DAO_TOTAL_FIELD_CANDIDATES = os.getenv("DAO_TOTAL_FIELDS", "✅Đáo/thối,total,pre,tong,Σ").split(",")
+DAO_CALC_TOTAL_FIELDS = ["trước", "pre"]
 DAO_PERDAY_FIELD_CANDIDATES = os.getenv("DAO_PERDAY_FIELDS", "G ngày,per_day,perday,trước /ngày").split(",")
 DAO_CHECKFIELD_CANDIDATES = os.getenv("DAO_CHECK_FIELDS", "Đáo/Thối,Đáo,Đáo Thối,dao,daothoi").split(",")
 # Operational settings
@@ -487,17 +488,17 @@ def check_checkfield_has_check(props: dict, candidates: List[str]) -> bool:
             return True
     return False
 
-def build_dao_preview_text(name: str, total: float, per_day: float, days: int, start_date: datetime) -> str:
+def build_dao_preview_text(name: str, display_total: Optional[float], per_day: Optional[float], days: int, start_date: datetime, calc_total: Optional[float]) -> str:
     lines = []
-    lines.append(f"🔔 đáo lại cho: {name} - Tổng đáo: ✅ {int(total) if total is not None else total}")
-    lines.append(f"Lấy trước: {days} ngày {int(per_day) if per_day is not None else per_day} | {int(total) if total is not None else total}")
+    lines.append(f"🔔 đáo lại cho: {name} - Tổng đáo: ✅ {int(display_total) if display_total is not None else display_total}")
+    lines.append(f"Lấy trước: {days} ngày {int(per_day) if per_day is not None else per_day} | {int(calc_total) if calc_total is not None else calc_total}")
     lines.append("")
     lines.append("Danh sách ngày dự kiến tạo (bắt đầu từ hôm nay):")
     for i in range(days):
         dt = start_date.date() + timedelta(days=i)
         lines.append(f"{i+1}. {dt.isoformat()}")
     lines.append("")
-    lines.append(f"Gửi 'ok' để tạo {days} page (đã check), hoặc 'cancel' để hủy.")
+    lines.append(f"Gửi 'ok' để tạo {days} page, hoặc 'cancel' để hủy.")
     return "\n".join(lines)
 
 def notion_find_pages_by_name_and_date_in_db(db_id: str, name_token: str, date_iso: str) -> List[dict]:
@@ -948,31 +949,33 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
         props = page.get("properties", {})
         ok_check = check_checkfield_has_check(props, DAO_CHECKFIELD_CANDIDATES)
         if not ok_check:
-            send_telegram(chat_id, f"⚠️ Page {preview} (id: {pid}) không có ✅ ở cột Đáo/Thối. Hủy thao tác.")
+            send_telegram(chat_id, f"🔴 chưa thể đáo cho {preview}.")
             return
-        total = extract_number_from_prop(props, DAO_TOTAL_FIELD_CANDIDATES)
+        display_total = extract_number_from_prop(props, DAO_TOTAL_FIELD_CANDIDATES)
         per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
+        calc_total = extract_number_from_prop(props, DAO_CALC_TOTAL_FIELDS) or display_total
         if per_day is None or per_day == 0:
             send_telegram(chat_id, f"⚠️ Không tìm thấy hoặc per_day = 0. Kiểm tra cột phần/ngày trên page {preview}.")
             return
-        if total is None:
+        if calc_total is None:
             send_telegram(chat_id, f"⚠️ Không tìm thấy total trên page {preview}.")
             return
-        days = int(math.ceil(total / per_day))
+        days = int(math.ceil(calc_total / per_day))
         if days <= 0:
             send_telegram(chat_id, f"⚠️ Kết quả days không hợp lệ: {days}.")
             return
         if days > DAO_MAX_DAYS:
             send_telegram(chat_id, f"⚠️ Số ngày ({days}) vượt mức tối đa ({DAO_MAX_DAYS}). Hãy giảm hoặc thay đổi per_day.")
             return
-        preview_text = build_dao_preview_text(preview, total, per_day, days, datetime.now())
+        preview_text = build_dao_preview_text(preview, display_total, per_day, days, datetime.now(), calc_total)
         pending_confirm[str(chat_id)] = {
             "type": "dao_confirm",
             "keyword": keyword,
             "source_page_id": pid,
             "source_preview": preview,
-            "total": total,
+            "display_total": display_total,
             "per_day": per_day,
+            "calc_total": calc_total,
             "days": days,
             "start_date": datetime.now().date().isoformat(),
             "expires": time.time() + DAO_CONFIRM_TIMEOUT,
@@ -1009,20 +1012,21 @@ def process_pending_selection_for_dao(chat_id: str, text: str):
             props = page.get("properties", {})
             ok_check = check_checkfield_has_check(props, DAO_CHECKFIELD_CANDIDATES)
             if not ok_check:
-                send_telegram(chat_id, f"⚠️ Page {preview} (id: {pid}) không có ✅ ở cột Đáo/Thối. Hủy thao tác.")
+                send_telegram(chat_id, f"🔴 chưa thể đáo cho {preview}.")
                 del pending_confirm[str(chat_id)]
                 return
-            total = extract_number_from_prop(props, DAO_TOTAL_FIELD_CANDIDATES)
+            display_total = extract_number_from_prop(props, DAO_TOTAL_FIELD_CANDIDATES)
             per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
+            calc_total = extract_number_from_prop(props, DAO_CALC_TOTAL_FIELDS) or display_total
             if per_day is None or per_day == 0:
                 send_telegram(chat_id, f"⚠️ per_day không hợp lệ trên page {preview}.")
                 del pending_confirm[str(chat_id)]
                 return
-            if total is None:
+            if calc_total is None:
                 send_telegram(chat_id, f"⚠️ total không tìm được trên page {preview}.")
                 del pending_confirm[str(chat_id)]
                 return
-            days = int(math.ceil(total / per_day))
+            days = int(math.ceil(calc_total / per_day))
             if days > DAO_MAX_DAYS:
                 send_telegram(chat_id, f"⚠️ Số ngày ({days}) vượt mức tối đa ({DAO_MAX_DAYS}). Hủy.")
                 del pending_confirm[str(chat_id)]
@@ -1032,14 +1036,15 @@ def process_pending_selection_for_dao(chat_id: str, text: str):
                 "keyword": pc.get("keyword"),
                 "source_page_id": pid,
                 "source_preview": preview,
-                "total": total,
+                "display_total": display_total,
                 "per_day": per_day,
+                "calc_total": calc_total,
                 "days": days,
                 "start_date": datetime.now().date().isoformat(),
                 "expires": time.time() + DAO_CONFIRM_TIMEOUT,
                 "orig_command": pc.get("orig_command")
             }
-            preview_text = build_dao_preview_text(preview, total, per_day, days, datetime.now())
+            preview_text = build_dao_preview_text(preview, display_total, per_day, days, datetime.now(), calc_total)
             send_long_text(chat_id, preview_text)
             return
         except Exception as e:
@@ -1079,7 +1084,7 @@ def process_pending_selection_for_dao(chat_id: str, text: str):
                 "source_page": src_pid,
                 "created_ids": [c.get("id") for c in created],
                 "skipped": skipped,
-                "params": {"days": days, "per_day": pcdata.get("per_day"), "total": pcdata.get("total")}
+                "params": {"days": days, "per_day": pcdata.get("per_day"), "calc_total": pcdata.get("calc_total")}
             })
             lines = []
             if created:
