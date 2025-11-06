@@ -46,7 +46,7 @@ DAO_CONFIRM_TIMEOUT = int(os.getenv("DAO_CONFIRM_TIMEOUT", 120))
 DAO_MAX_DAYS = int(os.getenv("DAO_MAX_DAYS", 30))
 DAO_TOTAL_FIELD_CANDIDATES = os.getenv("DAO_TOTAL_FIELDS", "✅Đáo/thối,total,pre,tong,Σ").split(",")
 DAO_CALC_TOTAL_FIELDS = ["trước", "pre", "# trước"]
-DAO_PERDAY_FIELD_CANDIDATES = os.getenv("DAO_PERDAY_FIELDS", "G ngày,per_day,perday,trước /ngày").split(",")
+DAO_PERDAY_FIELD_CANDIDATES = os.getenv("DAO_PERDAY_FIELDS", "G ngày,per_day,perday,trước /ngày,Q G ngày").split(",")
 DAO_CHECKFIELD_CANDIDATES = os.getenv("DAO_CHECK_FIELDS", "Đáo/Thối,Đáo,Đáo Thối,dao,daothoi").split(",")
 # Operational settings
 WAIT_CONFIRM = int(os.getenv("WAIT_CONFIRM", 120))
@@ -292,6 +292,16 @@ def extract_prop_text(props: dict, name: str) -> str:
         if ptype == "formula":
             form = prop.get("formula", {})
             return (form.get("string") or "").strip()
+        if ptype == "rollup":
+            roll = prop.get("rollup", {})
+            if roll.get("type") == "number":
+                num = roll.get("number")
+                return str(num) if num is not None else ""
+            elif roll.get("type") == "array":
+                arr = roll.get("array", [])
+                return ", ".join([extract_prop_text({"prop": a}, "prop") for a in arr])
+            else:
+                return ""
         if ptype == "url":
             return (prop.get("url") or "").strip()
         if ptype == "select":
@@ -301,6 +311,9 @@ def extract_prop_text(props: dict, name: str) -> str:
             arr = prop.get("multi_select", [])
             if isinstance(arr, list):
                 return ", ".join([a.get("name", "") for a in arr]).strip()
+        if ptype == "number":
+            num = prop.get("number")
+            return str(num) if num is not None else ""
         for c in ("plain_text", "text", "name", "value"):
             v = prop.get(c)
             if isinstance(v, str) and v.strip():
@@ -1046,11 +1059,11 @@ def process_pending_selection_for_dao(chat_id: str, text: str):
             per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
             calc_total = extract_number_from_prop(props, DAO_CALC_TOTAL_FIELDS) or display_total
             if per_day is None or per_day == 0:
-                send_telegram(chat_id, f"⚠️ per_day không hợp lệ trên page {preview}.")
+                send_telegram(chat_id, f"⚠️ Không tìm thấy hoặc per_day = 0. Kiểm tra cột phần/ngày trên page {preview}.")
                 del pending_confirm[str(chat_id)]
                 return
             if calc_total is None:
-                send_telegram(chat_id, f"⚠️ total không tìm được trên page {preview}.")
+                send_telegram(chat_id, f"⚠️ Không tìm thấy total trên page {preview}.")
                 del pending_confirm[str(chat_id)]
                 return
             days = int(math.ceil(calc_total / per_day))
