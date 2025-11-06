@@ -523,7 +523,7 @@ def find_matching_pages_counts(db_id: str, keyword: str) -> Tuple[int, int]:
 
 # ---------------- DAO (đáo) specific helpers ----------------
 def find_first_valid_target_for_dao(keyword: str) -> Optional[Tuple[str, dict]]:
-    matches = find_matching_all_pages(NOTION_DATABASE_ID, keyword, limit=MAX_PREVIEW)
+    matches = find_matching_all_pages(TARGET_NOTION_DATABASE_ID, keyword, limit=MAX_PREVIEW)
     if not matches:
         return None
     if len(matches) == 1:
@@ -591,7 +591,7 @@ def create_pages_for_dates(user_chat: str, name: str, source_page_id: str, dates
     skipped = []
     for dt in dates:
         date_iso = dt.date().isoformat()
-        existing = notion_find_pages_by_name_and_date(TARGET_NOTION_DATABASE_ID, name, date_iso)
+        existing = notion_find_pages_by_name_and_date(NOTION_DATABASE_ID, name, date_iso)
         if existing:
             skipped.append({"date": date_iso, "reason": "exists", "page_id": existing[0].get("id")})
             continue
@@ -605,7 +605,7 @@ def create_pages_for_dates(user_chat: str, name: str, source_page_id: str, dates
             checkbox_key: {"checkbox": True},
             "Source Page": {"rich_text": [{"text": {"content": source_text}}]}
         }
-        ok, created_obj = notion_create_page_in_db(TARGET_NOTION_DATABASE_ID, properties)
+        ok, created_obj = notion_create_page_in_db(NOTION_DATABASE_ID, properties)
         if ok:
             created.append(created_obj)
         else:
