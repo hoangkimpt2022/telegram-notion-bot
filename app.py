@@ -45,7 +45,7 @@ DATE_PROP_NAME = os.getenv("DATE_PROP_NAME", "Ngày Góp")
 DAO_CONFIRM_TIMEOUT = int(os.getenv("DAO_CONFIRM_TIMEOUT", 120))
 DAO_MAX_DAYS = int(os.getenv("DAO_MAX_DAYS", 30))
 DAO_TOTAL_FIELD_CANDIDATES = os.getenv("DAO_TOTAL_FIELDS", "✅Đáo/thối,total,pre,tong,Σ").split(",")
-DAO_CALC_TOTAL_FIELDS = ["trước", "pre"]
+DAO_CALC_TOTAL_FIELDS = ["trước", "pre", "# trước"]
 DAO_PERDAY_FIELD_CANDIDATES = os.getenv("DAO_PERDAY_FIELDS", "G ngày,per_day,perday,trước /ngày").split(",")
 DAO_CHECKFIELD_CANDIDATES = os.getenv("DAO_CHECK_FIELDS", "Đáo/Thối,Đáo,Đáo Thối,dao,daothoi").split(",")
 # Operational settings
@@ -661,16 +661,35 @@ def handle_command_mark(chat_id: str, keyword: str, count: Optional[int], orig_c
                 "succeeded": [{"page_id": p, "preview": pr, "date": dt} for p, pr, dt in succeeded],
                 "failed": failed
             })
-            res_lines = []
+            # --- Paste this after you have `succeeded` và trước khi gửi message kết quả ---
+            try:
+                # cập nhật lại counts sau khi đã mark (lấy từ DB calendar)
+                unchecked_count, checked_count = find_matching_pages_counts(NOTION_DATABASE_ID, keyword)
+            except Exception:
+                unchecked_count, checked_count = None, None
+            out_lines = []
             if succeeded:
-                res_lines.append(f"✅ Đã đánh dấu {len(succeeded)} mục cho '{keyword}':")
+                out_lines.append(f"✅ Đã đánh dấu {len(succeeded)} mục:")
                 for i, (p, pr, dt) in enumerate(succeeded, start=1):
-                    res_lines.append(f"{i}. [{dt[:10] if dt else '-'}] {pr}")
+                    out_lines.append(f"{i}. [{dt[:10] if dt else '-'}] {pr}")
+            else:
+                out_lines.append("ℹ️ Không có mục nào được đánh dấu.")
+            out_lines.append("") # blank line
+            # thêm summary tổng (nếu lấy được)
+            if checked_count is not None and unchecked_count is not None:
+                out_lines.append(f"✅ Đã tích: {checked_count}")
+                out_lines.append(f"🟡 Chưa tích: {unchecked_count}")
+            else:
+                out_lines.append("ℹ️ Không thể lấy số liệu tổng (lỗi khi đọc DB).")
+            # gửi kết quả (dùng send_long_text để tránh quá dài)
+            send_long_text(chat_id, "\n".join(out_lines))
+            # --- end snippet ---
             if failed:
-                res_lines.append("\n⚠️ Một vài mục không cập nhật:")
+                fail_lines = []
+                fail_lines.append("\n⚠️ Một vài mục không cập nhật:")
                 for i, item in enumerate(failed, start=1):
-                    res_lines.append(f"{i}. {item[1]} ({item[3]})")
-            send_long_text(chat_id, "\n".join(res_lines))
+                    fail_lines.append(f"{i}. {item[1]} ({item[3]})")
+                send_long_text(chat_id, "\n".join(fail_lines))
             return
         matches_full = find_matching_unchecked_pages(NOTION_DATABASE_ID, keyword, limit=MAX_PREVIEW)
         header = f"🔎 : '{keyword}'\n" \
@@ -805,16 +824,35 @@ def process_pending_selection(chat_id: str, text: str):
             "selected": [{"page_id": p, "preview": pr, "date": dt} for p, pr, dt in succeeded],
             "failed": failed
         })
-        out = []
+        # --- Paste this after you have `succeeded` và trước khi gửi message kết quả ---
+        try:
+            # cập nhật lại counts sau khi đã mark (lấy từ DB calendar)
+            unchecked_count, checked_count = find_matching_pages_counts(NOTION_DATABASE_ID, pc.get("keyword"))
+        except Exception:
+            unchecked_count, checked_count = None, None
+        out_lines = []
         if succeeded:
-            out.append(f"✅ Đã đánh dấu {len(succeeded)} mục:")
+            out_lines.append(f"✅ Đã đánh dấu {len(succeeded)} mục:")
             for i, (p, pr, dt) in enumerate(succeeded, start=1):
-                out.append(f"{i}. [{dt[:10] if dt else '-'}] {pr}")
+                out_lines.append(f"{i}. [{dt[:10] if dt else '-'}] {pr}")
+        else:
+            out_lines.append("ℹ️ Không có mục nào được đánh dấu.")
+        out_lines.append("") # blank line
+        # thêm summary tổng (nếu lấy được)
+        if checked_count is not None and unchecked_count is not None:
+            out_lines.append(f"✅ Đã tích: {checked_count}")
+            out_lines.append(f"🟡 Chưa tích: {unchecked_count}")
+        else:
+            out_lines.append("ℹ️ Không thể lấy số liệu tổng (lỗi khi đọc DB).")
+        # gửi kết quả (dùng send_long_text để tránh quá dài)
+        send_long_text(chat_id, "\n".join(out_lines))
+        # --- end snippet ---
         if failed:
-            out.append("\n⚠️ Một vài mục không cập nhật:")
+            fail_lines = []
+            fail_lines.append("\n⚠️ Một vài mục không cập nhật:")
             for i, item in enumerate(failed, start=1):
-                out.append(f"{i}. {item[1]} ({item[3]})")
-        send_long_text(chat_id, "\n".join(out))
+                fail_lines.append(f"{i}. {item[1]} ({item[3]})")
+            send_long_text(chat_id, "\n".join(fail_lines))
         del pending_confirm[str(chat_id)]
         return
     elif typ == "archive":
