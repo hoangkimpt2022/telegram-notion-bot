@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-app.py - Complete webhook bot for Render/VPS
-Features:
- - Telegram webhook handler
- - Notion integration (read / patch / create / archive / revert)
- - Commands:
-    * "<name> N" or "<name>" => mark (đánh dấu checkbox) with preview + confirm
-    * "<name> xóa" or "<name> archive" => archive (move to archived)
-    * "<name> undo" => undo last mark/archive
-    * "<name> đáo" => new "dao" flow: if checkfield contains ✅, compute days = ceil(total/per_day),
-                       preview dates starting tomorrow, confirm 'ok' to create pages (checked)
- - Uses NOTION_DATABASE_ID as source and TARGET_NOTION_DATABASE_ID as target for created pages
- - Config via environment variables
+app.py - Complete webhook bot (merged + DAO relation fix)
+Behavior:
+ - "name đáo" -> search in TARGET_NOTION_DATABASE_ID (dao data)
+ - preview total/per_day/dates -> wait 'ok'
+ - on 'ok' -> create pages in NOTION_DATABASE_ID (calendar DB)
+   with properties:
+     - Title = "{name} — đáo YYYY-MM-DD"
+     - DATE_PROP (Ngày Góp) = date
+     - CHECKBOX_PROP (Đã Góp) = True
+     - "Lịch G" (relation) -> link to source page id (source in TARGET_NOTION_DATABASE_ID)
+     - "Source Page" (rich_text) for trace
+ - idempotency: skip if page with same name token + date exists in NOTION_DATABASE_ID
+ - robust Notion retries, logging, and Telegram confirmation flow
 """
 import os
 import time
@@ -31,33 +32,33 @@ from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
 
-# ---------------- CONFIG (from env for Render) ----------------
+# ---------------- CONFIG (from env) ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # optional restrict
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")  # source db
-TARGET_NOTION_DATABASE_ID = os.getenv("TARGET_NOTION_DATABASE_ID")  # if not set -> use source
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")  # calendar DB (where to create pages)
+TARGET_NOTION_DATABASE_ID = os.getenv("TARGET_NOTION_DATABASE_ID")  # dao data DB (where to search)
 
 SEARCH_PROPERTY = ""  # "" means search title (Name)
 CHECKBOX_PROP = os.getenv("CHECKBOX_PROP", "Đã Góp")
 DATE_PROP_NAME = os.getenv("DATE_PROP_NAME", "Ngày Góp")
 
-# DAO specific config
-DAO_CONFIRM_TIMEOUT = int(os.getenv("DAO_CONFIRM_TIMEOUT", 120))  # seconds to wait for 'ok'
-DAO_MAX_DAYS = int(os.getenv("DAO_MAX_DAYS", 30))  # safety cap
+# DAO config
+DAO_CONFIRM_TIMEOUT = int(os.getenv("DAO_CONFIRM_TIMEOUT", 120))
+DAO_MAX_DAYS = int(os.getenv("DAO_MAX_DAYS", 30))
 DAO_TOTAL_FIELD_CANDIDATES = os.getenv("DAO_TOTAL_FIELDS", "trước,total,pre,tong,Σ").split(",")
 DAO_PERDAY_FIELD_CANDIDATES = os.getenv("DAO_PERDAY_FIELDS", "G ngày,per_day,perday,phần/ngày").split(",")
 DAO_CHECKFIELD_CANDIDATES = os.getenv("DAO_CHECK_FIELDS", "Đáo/Thối,Đáo,Đáo Thối,dao,daothoi").split(",")
 
-# Operational settings (override via env if needed)
+# Operational settings
 WAIT_CONFIRM = int(os.getenv("WAIT_CONFIRM", 120))
 NOTION_PAGE_SIZE = int(os.getenv("NOTION_PAGE_SIZE", 100))
-MAX_PREVIEW = int(os.getenv("MAX_PREVIEW", 30))
+MAX_PREVIEW = int(os.getenv("MAX_PREVIEW", 100))
 PATCH_DELAY = float(os.getenv("PATCH_DELAY", 0.45))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", 3))
 RETRY_SLEEP = float(os.getenv("RETRY_SLEEP", 1.0))
 LOG_PATH = Path(os.getenv("LOG_PATH", "notion_assistant_actions.log"))
-NOTION_CACHE_TTL = int(os.getenv("NOTION_CACHE_TTL", 20))  # seconds
+NOTION_CACHE_TTL = int(os.getenv("NOTION_CACHE_TTL", 20))
 
 if TELEGRAM_TOKEN:
     BASE_TELE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -70,32 +71,15 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
 }
 
-# state: pending_confirm used for multiple flows
+# state
 pending_confirm: Dict[str, Dict[str, Any]] = {}
 
-# ---------------- Simple Notion Cache ----------------
-_NOTION_CACHE = {
-    "ts": 0.0,
-    "pages": [],       # raw page dicts
-    "tokens_map": {},  # page_id -> list of normalized tokens
-    "preview_map": {}, # page_id -> preview text (title)
-    "props_map": {},   # page_id -> properties dict
-}
+# simple cache for source (calendar) DB (used by many functions)
+_NOTION_CACHE = {"ts": 0.0, "pages": [], "tokens_map": {}, "preview_map": {}, "props_map": {}}
 _cache_lock = threading.Lock()
 
 
-def invalidate_notion_cache(page_id: Optional[str] = None):
-    with _cache_lock:
-        if page_id:
-            _NOTION_CACHE["tokens_map"].pop(page_id, None)
-            _NOTION_CACHE["preview_map"].pop(page_id, None)
-            _NOTION_CACHE["props_map"].pop(page_id, None)
-            _NOTION_CACHE["pages"] = [p for p in _NOTION_CACHE["pages"] if p.get("id") != page_id]
-        else:
-            _NOTION_CACHE.update({"ts": 0.0, "pages": [], "tokens_map": {}, "preview_map": {}, "props_map": {}})
-
-
-# ---------------- Helpers / Utils ----------------
+# ---------------- Helpers ----------------
 def normalize_notion_id(maybe_id: Optional[str]) -> Optional[str]:
     if not maybe_id:
         return None
@@ -107,11 +91,7 @@ def normalize_notion_id(maybe_id: Optional[str]) -> Optional[str]:
 
 
 NOTION_DATABASE_ID = normalize_notion_id(NOTION_DATABASE_ID)
-if TARGET_NOTION_DATABASE_ID:
-    TARGET_NOTION_DATABASE_ID = normalize_notion_id(TARGET_NOTION_DATABASE_ID)
-else:
-    TARGET_NOTION_DATABASE_ID = NOTION_DATABASE_ID
-
+TARGET_NOTION_DATABASE_ID = normalize_notion_id(TARGET_NOTION_DATABASE_ID) if TARGET_NOTION_DATABASE_ID else None
 
 def log_action(entry: dict):
     try:
@@ -121,10 +101,8 @@ def log_action(entry: dict):
     except Exception as e:
         print("Log write error:", e)
 
-
 def now_iso():
     return datetime.now(timezone.utc).astimezone().isoformat()
-
 
 def send_telegram(chat_id: str, text: str) -> bool:
     if not BASE_TELE_URL:
@@ -138,7 +116,6 @@ def send_telegram(chat_id: str, text: str) -> bool:
     except Exception as e:
         print("Telegram send error:", e)
         return False
-
 
 def send_long_text(chat_id: str, text: str):
     limit = 3800
@@ -155,8 +132,7 @@ def send_long_text(chat_id: str, text: str):
         send_telegram(chat_id, p)
         time.sleep(0.2)
 
-
-# ---------------- Text normalization/tokenization ----------------
+# text utils
 def strip_accents(s: str) -> str:
     if not s:
         return ""
@@ -164,17 +140,14 @@ def strip_accents(s: str) -> str:
     s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
     return s
 
-
 def normalize_and_tokenize(s: str) -> List[str]:
     if not s:
         return []
     t = strip_accents(s).lower()
     return re.findall(r"\w+", t)
 
-
-# ---------------- Notion helpers ----------------
+# ---------------- Notion API helpers ----------------
 def notion_query_all_raw(db_id: str) -> List[dict]:
-    """Fetch all pages from Notion DB (no caching here)."""
     if not db_id:
         return []
     url = f"https://api.notion.com/v1/databases/{db_id}/query"
@@ -194,14 +167,13 @@ def notion_query_all_raw(db_id: str) -> List[dict]:
             break
     return results
 
-
 def _refresh_notion_cache_if_needed():
+    """Cache for NOTION_DATABASE_ID (calendar DB) used by many existing flows."""
     with _cache_lock:
         now = time.time()
         if now - _NOTION_CACHE["ts"] <= NOTION_CACHE_TTL and _NOTION_CACHE["pages"]:
             return
-        # fetch fresh
-        pages = notion_query_all_raw(NOTION_DATABASE_ID)
+        pages = notion_query_all_raw(NOTION_DATABASE_ID) if NOTION_DATABASE_ID else []
         _NOTION_CACHE["pages"] = pages
         _NOTION_CACHE["tokens_map"].clear()
         _NOTION_CACHE["preview_map"].clear()
@@ -217,14 +189,13 @@ def _refresh_notion_cache_if_needed():
             _NOTION_CACHE["props_map"][pid] = props
         _NOTION_CACHE["ts"] = now
 
-
 def notion_get_page(page_id: str) -> dict:
     url = f"https://api.notion.com/v1/pages/{page_id}"
     r = requests.get(url, headers=NOTION_HEADERS, timeout=15)
     if r.status_code != 200:
         raise RuntimeError(f"Notion get page error {r.status_code}: {r.text}")
-    # update cache entry
     page = r.json()
+    # update cache entry if it's in calendar db
     with _cache_lock:
         pid = page.get("id")
         props = page.get("properties", {})
@@ -236,7 +207,6 @@ def notion_get_page(page_id: str) -> dict:
         _NOTION_CACHE["props_map"][pid] = props
     return page
 
-
 def notion_patch_page_properties(page_id: str, properties: dict) -> Tuple[bool, str]:
     url = f"https://api.notion.com/v1/pages/{page_id}"
     body = {"properties": properties}
@@ -245,7 +215,6 @@ def notion_patch_page_properties(page_id: str, properties: dict) -> Tuple[bool, 
         try:
             r = requests.patch(url, headers=NOTION_HEADERS, json=body, timeout=15)
             if r.status_code in (200, 201):
-                invalidate_notion_cache(page_id)
                 return True, "OK"
             else:
                 err = f"{r.status_code}: {r.text}"
@@ -257,7 +226,6 @@ def notion_patch_page_properties(page_id: str, properties: dict) -> Tuple[bool, 
             time.sleep(RETRY_SLEEP * attempt)
     return False, err
 
-
 def notion_archive_page(page_id: str) -> Tuple[bool, str]:
     url = f"https://api.notion.com/v1/pages/{page_id}"
     body = {"archived": True}
@@ -266,7 +234,6 @@ def notion_archive_page(page_id: str) -> Tuple[bool, str]:
         try:
             r = requests.patch(url, headers=NOTION_HEADERS, json=body, timeout=15)
             if r.status_code in (200, 201):
-                invalidate_notion_cache(page_id)
                 return True, "OK"
             else:
                 err = f"{r.status_code}: {r.text}"
@@ -278,7 +245,6 @@ def notion_archive_page(page_id: str) -> Tuple[bool, str]:
             time.sleep(RETRY_SLEEP * attempt)
     return False, err
 
-
 def notion_archive_page_revert(page_id: str) -> Tuple[bool, str]:
     url = f"https://api.notion.com/v1/pages/{page_id}"
     body = {"archived": False}
@@ -287,7 +253,6 @@ def notion_archive_page_revert(page_id: str) -> Tuple[bool, str]:
         try:
             r = requests.patch(url, headers=NOTION_HEADERS, json=body, timeout=15)
             if r.status_code in (200, 201):
-                invalidate_notion_cache(page_id)
                 return True, "OK"
             else:
                 err = f"{r.status_code}: {r.text}"
@@ -296,7 +261,6 @@ def notion_archive_page_revert(page_id: str) -> Tuple[bool, str]:
             err = str(e)
             time.sleep(RETRY_SLEEP * attempt)
     return False, err
-
 
 def notion_create_page_in_db(db_id: str, properties: dict) -> Tuple[bool, dict]:
     url = "https://api.notion.com/v1/pages"
@@ -307,7 +271,6 @@ def notion_create_page_in_db(db_id: str, properties: dict) -> Tuple[bool, dict]:
             r = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=20)
             if r.status_code in (200, 201):
                 created = r.json()
-                invalidate_notion_cache()  # refresh on next access
                 return True, created
             else:
                 err = {"status": r.status_code, "text": r.text}
@@ -319,34 +282,11 @@ def notion_create_page_in_db(db_id: str, properties: dict) -> Tuple[bool, dict]:
             time.sleep(RETRY_SLEEP * attempt)
     return False, err
 
-
-def notion_find_pages_by_name_and_date(db_id: str, name_token: str, date_iso: str) -> List[dict]:
-    """
-    Query DB for pages where title contains name_token (normalized token) and date equals date_iso.
-    For idempotency check prior to creating.
-    Implement simple scan via cache (fast) - acceptable for moderate DB sizes.
-    """
-    pages, tokens_map, preview_map, props_map = _get_cached_pages_and_maps()
-    res = []
-    nt = strip_accents(name_token).lower()
-    for p in pages:
-        pid = p.get("id")
-        tokens = tokens_map.get(pid, [])
-        if nt in tokens:
-            # check date prop
-            props = props_map.get(pid, {})
-            d = extract_date_from_prop(props, DATE_PROP_NAME)
-            if d and d.startswith(date_iso):
-                res.append(p)
-    return res
-
-
 # ---------------- Extractors ----------------
 def _join_plain_text_array(arr):
     if not arr:
         return ""
     return "".join([x.get("plain_text", "") for x in arr if isinstance(x, dict)]).strip()
-
 
 def extract_prop_text(props: dict, name: str) -> str:
     if not props:
@@ -386,13 +326,11 @@ def extract_prop_text(props: dict, name: str) -> str:
         pass
     return str(prop).strip()
 
-
 def extract_title_from_props(props: dict) -> str:
     for k, v in props.items():
         if isinstance(v, dict) and v.get("type") == "title":
             return _join_plain_text_array(v.get("title", []))
     return extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
-
 
 def find_date_for_page(p: dict) -> Optional[str]:
     props = p.get("properties", {})
@@ -409,7 +347,6 @@ def find_date_for_page(p: dict) -> Optional[str]:
                     return start
     return p.get("created_time")
 
-
 def extract_date_from_prop(props: dict, prop_name: str) -> Optional[str]:
     key = None
     for k in props.keys():
@@ -424,7 +361,6 @@ def extract_date_from_prop(props: dict, prop_name: str) -> Optional[str]:
             return dt.get("start")
     return None
 
-
 def is_checked(props: dict, checkbox_name: str) -> Optional[bool]:
     key = None
     for k in props.keys():
@@ -437,8 +373,7 @@ def is_checked(props: dict, checkbox_name: str) -> Optional[bool]:
         return bool(v.get("checkbox"))
     return None
 
-
-# ---------------- Search & Sort (using cache and token match) ----------------
+# ---------------- Matching helpers ----------------
 def parse_date_or_max(s: str):
     if not s:
         return datetime.max.replace(tzinfo=timezone.utc)
@@ -453,12 +388,10 @@ def parse_date_or_max(s: str):
         except:
             return datetime.max.replace(tzinfo=timezone.utc)
 
-
 def _get_cached_pages_and_maps():
     _refresh_notion_cache_if_needed()
     with _cache_lock:
         return _NOTION_CACHE["pages"], _NOTION_CACHE["tokens_map"], _NOTION_CACHE["preview_map"], _NOTION_CACHE["props_map"]
-
 
 def find_matching_unchecked_pages(db_id: str, keyword: str, limit: Optional[int] = None) -> List[Tuple[str, str, str]]:
     keyword = (keyword or "").strip()
@@ -481,8 +414,31 @@ def find_matching_unchecked_pages(db_id: str, keyword: str, limit: Optional[int]
     matches_sorted = sorted(matches, key=lambda it: (parse_date_or_max(it[2]), it[1].lower()))
     return matches_sorted[:limit] if limit else matches_sorted
 
+def find_matching_all_pages_in_db(db_id: str, keyword: str, limit: Optional[int] = None) -> List[Tuple[str, str, str]]:
+    """
+    Query a given db_id (no cache) and return tuples (page_id, title, date_iso)
+    Used for DAO search in TARGET_NOTION_DATABASE_ID.
+    """
+    keyword = (keyword or "").strip()
+    if not keyword or not db_id:
+        return []
+    pages = notion_query_all_raw(db_id)
+    keyword_norm = strip_accents(keyword).lower()
+    matches = []
+    for p in pages:
+        pid = p.get("id")
+        props = p.get("properties", {})
+        title = extract_title_from_props(props) or pid
+        combined = " ".join([title, extract_prop_text(props, SEARCH_PROPERTY) or ""])
+        tokens = normalize_and_tokenize(combined)
+        if keyword_norm in tokens:
+            date_iso = find_date_for_page(p) or ""
+            matches.append((pid, title, date_iso))
+    matches_sorted = sorted(matches, key=lambda it: (parse_date_or_max(it[2]), it[1].lower()))
+    return matches_sorted[:limit] if limit else matches_sorted
 
 def find_matching_all_pages(db_id: str, keyword: str, limit: Optional[int] = None) -> List[Tuple[str, str, str]]:
+    # default behavior uses cached calendar DB (NOTION_DATABASE_ID)
     keyword = (keyword or "").strip()
     if not keyword or not db_id:
         return []
@@ -498,7 +454,6 @@ def find_matching_all_pages(db_id: str, keyword: str, limit: Optional[int] = Non
             matches.append((pid, preview, date_iso))
     matches_sorted = sorted(matches, key=lambda it: (parse_date_or_max(it[2]), it[1].lower()))
     return matches_sorted[:limit] if limit else matches_sorted
-
 
 def find_matching_pages_counts(db_id: str, keyword: str) -> Tuple[int, int]:
     keyword = (keyword or "").strip()
@@ -520,22 +475,7 @@ def find_matching_pages_counts(db_id: str, keyword: str) -> Tuple[int, int]:
                 unchecked += 1
     return unchecked, checked
 
-
-# ---------------- DAO (đáo) specific helpers ----------------
-def find_first_valid_target_for_dao(keyword: str) -> Optional[Tuple[str, dict]]:
-    matches = find_matching_all_pages(TARGET_NOTION_DATABASE_ID, keyword, limit=MAX_PREVIEW)
-    if not matches:
-        return None
-    if len(matches) == 1:
-        pid = matches[0][0]
-        try:
-            page = notion_get_page(pid)
-            return pid, page
-        except:
-            return None
-    return None
-
-
+# ---------------- DAO helpers & create with relation ----------------
 def extract_number_from_prop(props: dict, candidate_names: List[str]) -> Optional[float]:
     for name in candidate_names:
         val = extract_prop_text(props, name)
@@ -547,6 +487,7 @@ def extract_number_from_prop(props: dict, candidate_names: List[str]) -> Optiona
                     return float(m[0])
                 except:
                     continue
+    # fallback: scan all props
     for k, v in props.items():
         text = extract_prop_text(props, k)
         if text:
@@ -559,7 +500,6 @@ def extract_number_from_prop(props: dict, candidate_names: List[str]) -> Optiona
                     continue
     return None
 
-
 def check_checkfield_has_check(props: dict, candidates: List[str]) -> bool:
     for name in candidates:
         txt = extract_prop_text(props, name)
@@ -570,7 +510,6 @@ def check_checkfield_has_check(props: dict, candidates: List[str]) -> bool:
         if txt and "✅" in txt:
             return True
     return False
-
 
 def build_dao_preview_text(name: str, total: float, per_day: float, days: int, start_date: datetime):
     lines = []
@@ -585,26 +524,55 @@ def build_dao_preview_text(name: str, total: float, per_day: float, days: int, s
     lines.append(f"Gửi 'ok' để tạo {days} page (đã check), hoặc 'cancel' để hủy.")
     return "\n".join(lines)
 
+def notion_find_pages_by_name_and_date_in_db(db_id: str, name_token: str, date_iso: str) -> List[dict]:
+    """
+    Check existence in a given db (used for idempotency); not cached for reliability.
+    """
+    pages = notion_query_all_raw(db_id)
+    nt = strip_accents(name_token).lower()
+    res = []
+    for p in pages:
+        props = p.get("properties", {})
+        title = extract_title_from_props(props) or ""
+        tokens = normalize_and_tokenize(title)
+        if nt in tokens:
+            d = extract_date_from_prop(props, DATE_PROP_NAME)
+            if d and d.startswith(date_iso):
+                res.append(p)
+    return res
 
 def create_pages_for_dates(user_chat: str, name: str, source_page_id: str, dates: List[datetime]) -> Tuple[List[dict], List[dict]]:
+    """
+    Create pages in NOTION_DATABASE_ID (calendar DB).
+    Set 'Lịch G' relation to source_page_id (which lives in TARGET_NOTION_DATABASE_ID).
+    """
     created = []
     skipped = []
     for dt in dates:
         date_iso = dt.date().isoformat()
-        existing = notion_find_pages_by_name_and_date(NOTION_DATABASE_ID, name, date_iso)
+        existing = notion_find_pages_by_name_and_date_in_db(NOTION_DATABASE_ID, name, date_iso)
         if existing:
             skipped.append({"date": date_iso, "reason": "exists", "page_id": existing[0].get("id")})
             continue
+
         title_prop_key = "Name"
         date_prop_key = DATE_PROP_NAME or "Ngày Góp"
         checkbox_key = CHECKBOX_PROP
         source_text = f"source_page_id: {source_page_id}"
+
+        # Build properties including relation for "Lịch G" -> link to source page id
         properties = {
             title_prop_key: {"title": [{"text": {"content": f"{name} — đáo {date_iso}"}}]},
             date_prop_key: {"date": {"start": date_iso}},
             checkbox_key: {"checkbox": True},
             "Source Page": {"rich_text": [{"text": {"content": source_text}}]}
         }
+
+        # Add relation "Lịch G" if TARGET_NOTION_DATABASE_ID/source_page_id provided
+        if source_page_id:
+            # Relation expects {"relation": [{"id": "<page_id>"}]}
+            properties["Lịch G"] = {"relation": [{"id": source_page_id}]}
+
         ok, created_obj = notion_create_page_in_db(NOTION_DATABASE_ID, properties)
         if ok:
             created.append(created_obj)
@@ -613,8 +581,7 @@ def create_pages_for_dates(user_chat: str, name: str, source_page_id: str, dates
         time.sleep(0.25)
     return created, skipped
 
-
-# ---------------- Commands & Handlers ----------------
+# ---------------- Command parsing & handlers ----------------
 def parse_user_command(text: str) -> Tuple[str, Optional[int], str]:
     text = (text or "").strip()
     if not text:
@@ -638,14 +605,12 @@ def parse_user_command(text: str) -> Tuple[str, Optional[int], str]:
     keyword = " ".join(parts).strip()
     return keyword, n, action
 
-
 def build_preview_lines(matches: List[Tuple[str, str, str]]) -> List[str]:
     lines = []
     for i, (pid, pre, d) in enumerate(matches, start=1):
         date_part = d[:10] if d else "-"
         lines.append(f"{i}. [{date_part}] {pre}")
     return lines
-
 
 def parse_selection_text(sel_text: str, total: int) -> List[int]:
     s = sel_text.strip().lower()
@@ -678,14 +643,12 @@ def parse_selection_text(sel_text: str, total: int) -> List[int]:
                 continue
     return sorted(res)
 
-
-# -------- Mark / Archive / Undo handlers (full implementations) --------
+# --- Mark/Archive/Undo handlers kept from earlier full implementation ---
 def find_prop_key_case_insensitive(props: dict, name: str) -> Optional[str]:
     for k in props.keys():
         if k.lower() == name.lower():
             return k
     return None
-
 
 def handle_command_mark(chat_id: str, keyword: str, count: Optional[int], orig_cmd: str):
     try:
@@ -749,7 +712,7 @@ def handle_command_mark(chat_id: str, keyword: str, count: Optional[int], orig_c
         if not matches_full:
             send_telegram(chat_id, header + "Không còn mục chưa tích để hiển thị.")
             return
-        header += f"📤 Gửi số trong {WAIT_CONFIRM}s để chọn, hoặc /cancel.\n"
+        header += f"📤 Gửi số ( ví dụ 1 hoặc 1-3 ) trong {WAIT_CONFIRM}s để chọn, hoặc /cancel.\n"
         preview_lines = build_preview_lines(matches_full)
         send_long_text(chat_id, header + "\n".join(preview_lines))
         pending_confirm[str(chat_id)] = {
@@ -763,7 +726,6 @@ def handle_command_mark(chat_id: str, keyword: str, count: Optional[int], orig_c
         print("handle_command_mark exception:", e)
         traceback.print_exc()
         send_telegram(chat_id, f"❌ Lỗi xử lý mark: {e}")
-
 
 def handle_command_archive(chat_id: str, keyword: str, count: Optional[int], orig_cmd: str):
     try:
@@ -801,7 +763,7 @@ def handle_command_archive(chat_id: str, keyword: str, count: Optional[int], ori
             send_long_text(chat_id, "\n".join(res_lines))
             return
         preview_lines = build_preview_lines(matches)
-        header = f"🔎 : '{keyword}'\n" \
+        header = f"🔎 Khách hàng: '{keyword}'\n" \
                  f"✅ Đã tích: {checked_count}\n" \
                  f"🟡 Chưa tích: {unchecked_count}\n\n" \
                  f"⚠️ CHÚ Ý: Bạn sắp archive {len(matches)} mục chứa '{keyword}'. Gửi số (ví dụ 1-7) trong {WAIT_CONFIRM}s để chọn, hoặc 'all' để archive tất cả, hoặc /cancel.\n"
@@ -818,7 +780,6 @@ def handle_command_archive(chat_id: str, keyword: str, count: Optional[int], ori
         traceback.print_exc()
         send_telegram(chat_id, f"❌ Lỗi xử lý archive: {e}")
 
-
 def process_pending_selection(chat_id: str, text: str):
     pc = pending_confirm.get(str(chat_id))
     if not pc:
@@ -829,22 +790,9 @@ def process_pending_selection(chat_id: str, text: str):
         send_telegram(chat_id, "⏳ Hết thời gian chọn. Yêu cầu đã bị hủy.")
         return
     typ = pc.get("type")
-    # DAO choose or confirm handled in separate function
     if typ in ("dao_choose", "dao_confirm"):
-        # delegate to DAO-specific processor
-        try:
-            # reuse the DAO processing logic used earlier
-            # We call the same process_pending_selection implementation for DAO that we implement below.
-            # For simplicity, call the dao-specific processor
-            process_pending_selection_for_dao(chat_id, text)
-            return
-        except Exception as e:
-            print("DAO pending processing error:", e)
-            traceback.print_exc()
-            send_telegram(chat_id, f"❌ Lỗi pending DAO: {e}")
-            del pending_confirm[str(chat_id)]
-            return
-
+        process_pending_selection_for_dao(chat_id, text)
+        return
     matches = pc.get("matches", [])
     total = len(matches)
     sel_indices = parse_selection_text(text, total)
@@ -931,7 +879,6 @@ def process_pending_selection(chat_id: str, text: str):
         del pending_confirm[str(chat_id)]
         return
 
-
 def undo_last(chat_id: str, op_id: Optional[str], keyword: Optional[str] = None):
     if not LOG_PATH.exists():
         send_telegram(chat_id, "Không có log để undo.")
@@ -997,16 +944,19 @@ def undo_last(chat_id: str, op_id: Optional[str], keyword: Optional[str] = None)
         send_telegram(chat_id, "Không thể undo cho loại op này.")
         return
 
-
-# ---------------- DAO flow handlers ----------------
+# ---------------- DAO flow ----------------
 def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
     try:
         if not keyword:
             send_telegram(chat_id, "Vui lòng cung cấp tên (ví dụ: 'Trâm đáo').")
             return
-        matches = find_matching_all_pages(NOTION_DATABASE_ID, keyword, limit=MAX_PREVIEW)
+        # SEARCH in TARGET_NOTION_DATABASE_ID (dao data)
+        if not TARGET_NOTION_DATABASE_ID:
+            send_telegram(chat_id, "⚠️ TARGET_NOTION_DATABASE_ID chưa cấu hình.")
+            return
+        matches = find_matching_all_pages_in_db(TARGET_NOTION_DATABASE_ID, keyword, limit=MAX_PREVIEW)
         if not matches:
-            send_telegram(chat_id, f"⚠️ Không tìm thấy '{keyword}' trong DB.")
+            send_telegram(chat_id, f"⚠️ Không tìm thấy '{keyword}' trong DB đáo.")
             return
         if len(matches) > 1:
             header = f"Tìm thấy {len(matches)} kết quả cho '{keyword}'. Chọn index để tiếp tục hoặc gửi SĐT để match chính xác."
@@ -1020,6 +970,7 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
                 "orig_command": orig_cmd
             }
             return
+        # single match: use the page as source
         pid, preview, date_iso = matches[0]
         page = notion_get_page(pid)
         props = page.get("properties", {})
@@ -1042,7 +993,6 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
         if days > DAO_MAX_DAYS:
             send_telegram(chat_id, f"⚠️ Số ngày ({days}) vượt mức tối đa ({DAO_MAX_DAYS}). Hãy giảm hoặc thay đổi per_day.")
             return
-        today = datetime.now().date()
         preview_text = build_dao_preview_text(preview, total, per_day, days, datetime.now())
         pending_confirm[str(chat_id)] = {
             "type": "dao_confirm",
@@ -1061,7 +1011,6 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
         print("handle_command_dao exception:", e)
         traceback.print_exc()
         send_telegram(chat_id, f"❌ Lỗi xử lý dao: {e}")
-
 
 def process_pending_selection_for_dao(chat_id: str, text: str):
     pc = pending_confirm.get(str(chat_id))
@@ -1193,8 +1142,7 @@ def process_pending_selection_for_dao(chat_id: str, text: str):
     del pending_confirm[str(chat_id)]
     return
 
-
-# ---------------- Message Handler (quick ack + background) ----------------
+# ---------------- Message handler ----------------
 def handle_incoming_message(chat_id: str, text: str):
     try:
         if TELEGRAM_CHAT_ID and str(chat_id) != str(TELEGRAM_CHAT_ID):
@@ -1208,7 +1156,7 @@ def handle_incoming_message(chat_id: str, text: str):
 
         low = raw.lower().strip()
 
-        # If pending exists, treat selection or cancel
+        # Pending flow
         if str(chat_id) in pending_confirm:
             if low in ("/cancel", "cancel", "hủy", "huy"):
                 del pending_confirm[str(chat_id)]
@@ -1218,7 +1166,6 @@ def handle_incoming_message(chat_id: str, text: str):
                 send_telegram(chat_id, "Đang xử lý lựa chọn...")
                 threading.Thread(target=process_pending_selection, args=(chat_id, raw), daemon=True).start()
                 return
-            # else cancel pending and continue
             del pending_confirm[str(chat_id)]
 
         if low in ("/cancel", "cancel", "hủy", "huy"):
@@ -1253,8 +1200,7 @@ def handle_incoming_message(chat_id: str, text: str):
         except:
             pass
 
-
-# ---------------- Webhook Handler ----------------
+# ---------------- Webhook / health ----------------
 @app.route('/webhook', methods=['POST'])
 def webhook():
     update = request.get_json(silent=True)
@@ -1269,12 +1215,9 @@ def webhook():
             return Response('OK', status=200)
     return Response('OK', status=200)
 
-
-# simple health route
 @app.route('/')
 def home():
     return "OK", 200
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
