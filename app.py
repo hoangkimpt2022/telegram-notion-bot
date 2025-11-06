@@ -464,17 +464,6 @@ def extract_number_from_prop(props: dict, candidate_names: List[str]) -> Optiona
                     return float(m[0])
                 except ValueError:
                     continue
-    # fallback: scan all props
-    for k in props:
-        text = extract_prop_text(props, k)
-        if text:
-            v = text.replace(",", "")
-            m = re.findall(r"-?\d+\.?\d*", v)
-            if m:
-                try:
-                    return float(m[0])
-                except ValueError:
-                    continue
     return None
 
 def check_checkfield_has_check(props: dict, candidates: List[str]) -> bool:
