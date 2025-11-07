@@ -526,12 +526,7 @@ def build_dao_preview_text(name: str,
         per_day_disp = int(per_day) if per_day is not None else per_day
         lines.append(f"Lấy trước: {pd} ngày {per_day_disp} là {int(prev_total)}")
         extra_parts = []
-        if prev_total_key:
-            extra_parts.append(f"trong đó cột \"{prev_total_key}\" là Forula")
-        if prev_days_key:
-            extra_parts.append(f"{prev_days_key} là cột \"ngày trước\"")
-        if per_day_key:
-            extra_parts.append(f"{per_day_key} là cột \"G ngày\"")
+        
         if extra_parts:
             lines.append("(" + "; ".join(extra_parts) + ")")
     lines.append("")
@@ -916,7 +911,7 @@ def process_pending_selection(chat_id: str, text: str):
             send_telegram(chat_id, "Đã hủy thao tác đáo.")
             return
         if text.strip().lower() not in ("ok", "yes", "đồng ý", "dong y"):
-            send_telegram(chat_id, "Gửi 'ok' để xác nhận tạo pages, hoặc 'cancel' để hủy.")
+            send_telegram(chat_id, "Gửi '/ok' để xác nhận tạo pages, hoặc '/cancel' để hủy.")
             return
         pcdata = pc
         days = int(pcdata.get("days", 0))
