@@ -1128,7 +1128,7 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
         prev_days_val = int(prev_days_val) if prev_days_val is not None else None
         per_day = float(per_day_val) if per_day_val is not None else None
 
-            send_telegram(chat_id, f"⚠️ Không tìm thấy hoặc per_day = 0. Kiểm tra cột phần/ngày trên page {preview}.")
+            send_telegram(chat_id, f"⚠️ Không tìm thấy hoặc per_day = 0. Kiểm tra cột trước trên page {preview}.")
             return
         if calc_total is None:
             send_telegram(chat_id, f"⚠️ Không tìm thấy total trên page {preview}.")
