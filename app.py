@@ -34,7 +34,7 @@ DATE_PROP_NAME = os.getenv("DATE_PROP_NAME", "Ngày Góp")
 # DAO config & candidate column names (adjust to your Notion exact names if needed)
 DAO_CONFIRM_TIMEOUT = int(os.getenv("DAO_CONFIRM_TIMEOUT", 120))
 DAO_MAX_DAYS = int(os.getenv("DAO_MAX_DAYS", 40))
-DAO_TOTAL_FIELD_CANDIDATES = os.getenv("DAO_TOTAL_FIELDS", "✅Đáo/thối,total,pre,tong,Σ").split(",")
+DAO_TOTAL_FIELD_CANDIDATES = os.getenv("DAO_TOTAL_FIELDS", "✅Đáo/thối,calc_total,total,pre,tong,Σ").split(",")
 DAO_CALC_TOTAL_FIELDS = ["trước","prev_total", "pre", "# trước"]
 DAO_PERDAY_FIELD_CANDIDATES = os.getenv("DAO_PERDAY_FIELDS", "G ngày,per_day,perday,trước /ngày,Q G ngày").split(",")
 DAO_CHECKFIELD_CANDIDATES = os.getenv("DAO_CHECK_FIELDS", "Đáo/Thối,Đáo,Đáo Thối,dao,daothoi,✅Đáo/thối").split(",")
@@ -1068,7 +1068,7 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
 
         ok_check = check_checkfield_has_check(props, DAO_CHECKFIELD_CANDIDATES)
         if not ok_check:
-            send_telegram(chat_id, f"🔴 chưa thể đáo cho {preview}.")
+            send_telegram(chat_id, f"🔴 chưa thể đáo .")
             return
 
                 # --- Lấy giá trị "trước" chính xác từ Notion (bao gồm cả formula) ---
