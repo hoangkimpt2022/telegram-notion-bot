@@ -35,7 +35,7 @@ DATE_PROP_NAME = os.getenv("DATE_PROP_NAME", "Ngày Góp")
 DAO_CONFIRM_TIMEOUT = int(os.getenv("DAO_CONFIRM_TIMEOUT", 120))
 DAO_MAX_DAYS = int(os.getenv("DAO_MAX_DAYS", 30))
 DAO_TOTAL_FIELD_CANDIDATES = os.getenv("DAO_TOTAL_FIELDS", "✅Đáo/thối,total,pre,tong,Σ").split(",")
-DAO_CALC_TOTAL_FIELDS = ["trước", "pre", "# trước"]
+DAO_CALC_TOTAL_FIELDS = ["trước","prev_total", "pre", "# trước"]
 DAO_PERDAY_FIELD_CANDIDATES = os.getenv("DAO_PERDAY_FIELDS", "G ngày,per_day,perday,trước /ngày,Q G ngày").split(",")
 DAO_CHECKFIELD_CANDIDATES = os.getenv("DAO_CHECK_FIELDS", "Đáo/Thối,Đáo,Đáo Thối,dao,daothoi,✅Đáo/thối").split(",")
 
@@ -530,13 +530,13 @@ def build_dao_preview_text(name: str,
         if extra_parts:
             lines.append("(" + "; ".join(extra_parts) + ")")
     lines.append("")
-    lines.append("Danh sách ngày dự kiến tạo (bắt đầu từ ngày mai):")
+    lines.append("(bắt đầu từ ngày mai):")
     start_from = (start_date.date() + timedelta(days=1))
     for i in range(days):
         dt = start_from + timedelta(days=i)
         lines.append(f"{i+1}. {dt.isoformat()}")
     lines.append("")
-    lines.append(f"Gửi 'ok' để tạo {days} page, hoặc 'cancel' để hủy.")
+    lines.append(f"Gửi /ok để tạo {days} page, hoặc /cancel để hủy.")
     return "\n".join(lines)
 
 def notion_find_pages_by_name_and_date_in_db(db_id: str, name_token: str, date_iso: str) -> List[dict]:
