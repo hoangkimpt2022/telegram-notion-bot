@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-app.py - Complete webhook bot (mark/archive/undo + DAO đáo preview & create)
-Copy-paste this file and run. Requires env vars: TELEGRAM_TOKEN, NOTION_TOKEN, NOTION_DATABASE_ID, TARGET_NOTION_DATABASE_ID (optional).
+app.py - Telegram <-> Notion assistant (mark / archive / undo / dao flow)
+Config via env:
+  TELEGRAM_TOKEN, NOTION_TOKEN, NOTION_DATABASE_ID, TARGET_NOTION_DATABASE_ID (optional)
+Behavior:
+  - 'keyword' => show preview of unchecked items (mark flow)
+  - 'keyword N' => mark N items as checked
+  - 'keyword xóa' => archive flow
+  - 'keyword đáo' => dao flow (preview) -> send 'ok' to create pages -> creates pages and ticks checkbox
+Start on Render:
+  - Add gunicorn in requirements and use: gunicorn app:app --bind 0.0.0.0:$PORT --workers 4
 """
 import os
 import time
@@ -23,24 +31,24 @@ app = Flask(__name__)
 
 # ---------------- CONFIG (from env) ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # optional restrict
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # optional restrict to single chat id
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")  # calendar DB (where to create pages)
-TARGET_NOTION_DATABASE_ID = os.getenv("TARGET_NOTION_DATABASE_ID")  # dao data DB (where to search)
-SEARCH_PROPERTY = ""  # "" means search title (Name)
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")  # database to create new pages (calendar)
+TARGET_NOTION_DATABASE_ID = os.getenv("TARGET_NOTION_DATABASE_ID")  # database where DAO records live
+SEARCH_PROPERTY = ""  # optional property name to include for text search
 CHECKBOX_PROP = os.getenv("CHECKBOX_PROP", "Đã Góp")
 DATE_PROP_NAME = os.getenv("DATE_PROP_NAME", "Ngày Góp")
 
-# DAO config & candidate column names (adjust to your Notion exact names if needed)
+# DAO config & candidate column names
 DAO_CONFIRM_TIMEOUT = int(os.getenv("DAO_CONFIRM_TIMEOUT", 120))
 DAO_MAX_DAYS = int(os.getenv("DAO_MAX_DAYS", 40))
-DAO_TOTAL_FIELD_CANDIDATES = os.getenv("DAO_calc_total_FIELDS", "✅Đáo/thối,calc_total,,pre,tong,Σ").split(",")
-DAO_CALC_TOTAL_FIELDS = ["trước","prev_total", "pre", "# trước"]
+DAO_TOTAL_FIELD_CANDIDATES = os.getenv("DAO_TOTAL_FIELDS", "✅Đáo/thối,total,pre,tong,Σ").split(",")
+DAO_CALC_TOTAL_FIELDS = ["trước", "prev_total", "pre", "# trước"]
 DAO_PERDAY_FIELD_CANDIDATES = os.getenv("DAO_PERDAY_FIELDS", "G ngày,per_day,perday,trước /ngày,Q G ngày").split(",")
 DAO_CHECKFIELD_CANDIDATES = os.getenv("DAO_CHECK_FIELDS", "Đáo/Thối,Đáo,Đáo Thối,dao,daothoi,✅Đáo/thối").split(",")
 
-# Additional candidates to extract prev-days and prev-total
-DAO_PREV_TOTAL_CANDIDATES = ["trước", "pre", "prev", "prev_total", "for_pre", "forua"]
+# Additional candidates for prev total/days
+DAO_PREV_TOTAL_CANDIDATES = ["Trước", "trước", "truoc", "pre", "prev", "prev_total", "for_pre", "forua"]
 DAO_PREV_DAYS_CANDIDATES  = ["ngày trước", "ngày_trước", "ngay trước", "ngay_truoc", "days_before", "prev_days"]
 
 # Operational settings
@@ -53,6 +61,10 @@ RETRY_SLEEP = float(os.getenv("RETRY_SLEEP", 1.0))
 LOG_PATH = Path(os.getenv("LOG_PATH", "notion_assistant_actions.log"))
 NOTION_CACHE_TTL = int(os.getenv("NOTION_CACHE_TTL", 20))
 
+# Behavior choices from user: create pages and tick checkbox (you chose "Tạo thật" + "Có tick")
+AUTO_CREATE_ON_OK = True
+AUTO_TICK_CREATED = True
+
 if TELEGRAM_TOKEN:
     BASE_TELE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 else:
@@ -64,10 +76,8 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
 }
 
-# state (pending confirmations per chat)
+# state
 pending_confirm: Dict[str, Dict[str, Any]] = {}
-
-# simple cache for pages
 _NOTION_CACHE = {"ts": 0.0, "pages": [], "tokens_map": {}, "preview_map": {}, "props_map": {}}
 _cache_lock = threading.Lock()
 
@@ -88,15 +98,15 @@ def log_action(entry: dict):
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with LOG_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print("Log write error:", e)
+    except Exception:
+        pass
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
 
 def send_telegram(chat_id: str, text: str) -> bool:
     if not BASE_TELE_URL:
-        print("No TELEGRAM_TOKEN set; cannot send message.")
+        print("No TELEGRAM_TOKEN set; cannot send message:", text)
         return False
     try:
         r = requests.post(BASE_TELE_URL + "/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=15)
@@ -133,7 +143,7 @@ def normalize_and_tokenize(s: str) -> List[str]:
     t = strip_accents(s).lower()
     return re.findall(r"\w+", t)
 
-# ---------------- Notion API helpers ----------------
+# ---------------- Notion helpers ----------------
 def notion_query_all_raw(db_id: str) -> List[dict]:
     if not db_id:
         return []
@@ -201,11 +211,9 @@ def notion_patch_page_properties(page_id: str, properties: dict) -> Tuple[bool, 
                 return True, "OK"
             else:
                 err = f"{r.status_code}: {r.text}"
-                print("Notion patch error:", err)
             time.sleep(RETRY_SLEEP * attempt)
         except Exception as e:
             err = str(e)
-            print("Notion patch exception:", err)
             time.sleep(RETRY_SLEEP * attempt)
     return False, err
 
@@ -220,11 +228,9 @@ def notion_archive_page(page_id: str) -> Tuple[bool, str]:
                 return True, "OK"
             else:
                 err = f"{r.status_code}: {r.text}"
-                print("Notion archive error:", err)
             time.sleep(RETRY_SLEEP * attempt)
         except Exception as e:
             err = str(e)
-            print("Notion archive exception:", err)
             time.sleep(RETRY_SLEEP * attempt)
     return False, err
 
@@ -256,11 +262,9 @@ def notion_create_page_in_db(db_id: str, properties: dict) -> Tuple[bool, dict]:
                 return True, r.json()
             else:
                 err = {"status": r.status_code, "text": r.text}
-                print("Notion create error:", err)
             time.sleep(RETRY_SLEEP * attempt)
         except Exception as e:
             err = {"exception": str(e)}
-            print("Notion create exception:", err)
             time.sleep(RETRY_SLEEP * attempt)
     return False, err
 
@@ -453,7 +457,36 @@ def find_matching_pages_counts(db_id: str, keyword: str) -> Tuple[int, int]:
     return unchecked, checked
 
 # ---------------- DAO helpers & preview builder ----------------
+def _try_float_from_formula_or_number(val_local):
+    """
+    Phụ trợ: parse giá trị từ property dict (formula.number, formula.string, number, rich_text)
+    Trả về float hoặc None.
+    """
+    try:
+        if not isinstance(val_local, dict):
+            return None
+        if "formula" in val_local and isinstance(val_local["formula"], dict):
+            f = val_local["formula"]
+            if "number" in f and f["number"] is not None:
+                return float(f["number"])
+            if "string" in f and f["string"]:
+                try:
+                    return float(str(f["string"]).replace(",", "").strip())
+                except:
+                    return None
+        if "number" in val_local and val_local["number"] is not None:
+            return float(val_local["number"])
+        if "rich_text" in val_local and isinstance(val_local["rich_text"], list) and val_local["rich_text"]:
+            try:
+                return float(val_local["rich_text"][0].get("plain_text", "").replace(",", "").strip())
+            except:
+                return None
+    except:
+        return None
+    return None
+
 def extract_number_from_prop(props: dict, candidate_names: List[str]) -> Optional[float]:
+    # legacy simple extractor (kept for compatibility)
     for name in candidate_names:
         val = extract_prop_text(props, name)
         if val:
@@ -467,6 +500,7 @@ def extract_number_from_prop(props: dict, candidate_names: List[str]) -> Optiona
     return None
 
 def find_prop_key_and_number(props: dict, candidate_names: List[str]) -> Tuple[Optional[str], Optional[float]]:
+    # legacy helper, may return first numeric found
     if not props:
         return None, None
     for k in props:
@@ -481,29 +515,7 @@ def find_prop_key_and_number(props: dict, candidate_names: List[str]) -> Tuple[O
                             return k, float(m[0])
                         except:
                             continue
-    for cand in candidate_names:
-        for k in props:
-            if strip_accents(k).lower() == strip_accents(cand).lower():
-                val = extract_prop_text(props, k)
-                if val:
-                    m = re.findall(r"-?\d+\.?\d*", val.replace(",", "").strip())
-                    if m:
-                        try:
-                            return k, float(m[0])
-                        except:
-                            continue
     return None, None
-
-def check_checkfield_has_check(props: dict, candidates: List[str]) -> bool:
-    for name in candidates:
-        txt = extract_prop_text(props, name)
-        if txt and "✅" in txt:
-            return True
-    for k in props:
-        txt = extract_prop_text(props, k)
-        if txt and "✅" in txt:
-            return True
-    return False
 
 def build_dao_preview_text(name: str,
                            display_total: Optional[float],
@@ -526,17 +538,22 @@ def build_dao_preview_text(name: str,
         per_day_disp = int(per_day) if per_day is not None else per_day
         lines.append(f"Lấy trước: {pd} ngày {per_day_disp} là {int(prev_total)}")
         extra_parts = []
-        
+        if prev_total_key:
+            extra_parts.append(f"trong đó cột \"{prev_total_key}\" là Formula")
+        if prev_days_key:
+            extra_parts.append(f"{prev_days_key} là cột \"ngày trước\"")
+        if per_day_key:
+            extra_parts.append(f"{per_day_key} là cột \"G ngày\"")
         if extra_parts:
             lines.append("(" + "; ".join(extra_parts) + ")")
     lines.append("")
-    lines.append("(bắt đầu từ ngày mai):")
+    lines.append("Danh sách ngày dự kiến tạo (bắt đầu từ ngày mai):")
     start_from = (start_date.date() + timedelta(days=1))
     for i in range(days):
         dt = start_from + timedelta(days=i)
         lines.append(f"{i+1}. {dt.isoformat()}")
     lines.append("")
-    lines.append(f"Gửi /ok để tạo {days} page, hoặc /cancel để hủy.")
+    lines.append(f"Gửi 'ok' để tạo {days} page, hoặc 'cancel' để hủy.")
     return "\n".join(lines)
 
 def notion_find_pages_by_name_and_date_in_db(db_id: str, name_token: str, date_iso: str) -> List[dict]:
@@ -569,10 +586,11 @@ def create_pages_for_dates(user_chat: str, name: str, source_page_id: str, dates
         properties = {
             title_prop_key: {"title": [{"text": {"content": f"{name} — đáo {date_iso}"}}]},
             date_prop_key: {"date": {"start": date_iso}},
-            checkbox_key: {"checkbox": True},
+            checkbox_key: {"checkbox": True if AUTO_TICK_CREATED else False},
             "Source Page": {"rich_text": [{"text": {"content": source_text}}]},
         }
         if source_page_id:
+            # attach relation if the DB has such property; it's optional
             properties["Lịch G"] = {"relation": [{"id": source_page_id}]}
         ok, created_obj = notion_create_page_in_db(NOTION_DATABASE_ID, properties)
         if ok:
@@ -739,6 +757,7 @@ def handle_command_mark(chat_id: str, keyword: str, count: Optional[int], orig_c
         traceback.print_exc()
         send_telegram(chat_id, f"❌ Lỗi xử lý mark: {str(e)}")
 
+# ---------------- archive / pending / undo / dao processing ----------------
 def handle_command_archive(chat_id: str, keyword: str, count: Optional[int], orig_cmd: str):
     try:
         unchecked_count, checked_count = find_matching_pages_counts(NOTION_DATABASE_ID, keyword)
@@ -905,13 +924,12 @@ def process_pending_selection(chat_id: str, text: str):
         return
 
     elif typ == "dao_confirm":
-        # handle confirmation for DAO preview (/ok or cancel)
         if text.strip().lower() in ("/cancel", "cancel", "hủy", "huy"):
             del pending_confirm[str(chat_id)]
             send_telegram(chat_id, "Đã hủy thao tác đáo.")
             return
         if text.strip().lower() not in ("ok", "yes", "đồng ý", "dong y"):
-            send_telegram(chat_id, "Gửi '/ok' để xác nhận tạo pages, hoặc '/cancel' để hủy.")
+            send_telegram(chat_id, "Gửi 'ok' để xác nhận tạo pages, hoặc 'cancel' để hủy.")
             return
         pcdata = pc
         days = int(pcdata.get("days", 0))
@@ -928,7 +946,10 @@ def process_pending_selection(chat_id: str, text: str):
             name_preview = pcdata.get("source_preview")
             start_date = datetime.now().date() + timedelta(days=1)
             dates = [datetime.combine(start_date + timedelta(days=i), datetime.min.time()) for i in range(days)]
-            created, skipped = create_pages_for_dates(chat_id, name_preview, src_pid, dates)
+            if AUTO_CREATE_ON_OK:
+                created, skipped = create_pages_for_dates(chat_id, name_preview, src_pid, dates)
+            else:
+                created, skipped = [], []
             op_id = f"dao-{int(time.time())}-{random.randint(1000,9999)}"
             log_action({
                 "ts": now_iso(),
@@ -944,7 +965,11 @@ def process_pending_selection(chat_id: str, text: str):
             if created:
                 lines.append(f"✅ Đã tạo {len(created)} page cho 🔎 {name_preview}:")
                 for i, c in enumerate(created, start=1):
-                    dateval = c.get("properties", {}).get(DATE_PROP_NAME, {}).get("date", {}).get("start", "") if c.get("properties") else ""
+                    dateval = ""
+                    try:
+                        dateval = c.get("properties", {}).get(DATE_PROP_NAME, {}).get("date", {}).get("start", "")
+                    except:
+                        dateval = ""
                     lines.append(f"{i}.[{dateval}] page_id: {c.get('id')}")
             if skipped:
                 lines.append("")
@@ -954,7 +979,7 @@ def process_pending_selection(chat_id: str, text: str):
                         lines.append(f"- [ {s.get('date')} ] skipped (exists) page_id: {s.get('page_id')}")
                     else:
                         lines.append(f"- [ {s.get('date')} ] failed: {s.get('reason')} {s.get('error')}")
-            send_long_text(chat_id, "\n".join(lines))
+            send_long_text(chat_id, "\n".join(lines) if lines else "Không có page nào được tạo.")
             del pending_confirm[str(chat_id)]
             return
         except Exception as e:
@@ -1066,206 +1091,98 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
         page = notion_get_page(pid)
         props = page.get("properties", {})
 
-        ok_check = check_checkfield_has_check(props, DAO_CHECKFIELD_CANDIDATES)
+        # check if marked as ready (DAO_CHECKFIELD_CANDIDATES)
+        ok_check = False
+        for c in DAO_CHECKFIELD_CANDIDATES:
+            if extract_prop_text(props, c):
+                # if any contains '✅' or truthy, treat as ok
+                txt = extract_prop_text(props, c)
+                if "✅" in txt or txt.strip():
+                    ok_check = True
+                    break
         if not ok_check:
-            send_telegram(chat_id, f"🔴 chưa thể đáo .")
+            send_telegram(chat_id, f"🔴 chưa thể đáo cho {preview}.")
             return
 
-                # --- Lấy giá trị "trước" chính xác từ Notion (bao gồm cả formula) ---
+        # --- read prev_total (Trước) robustly ---
         prev_total_key, prev_total_val = None, None
         for key, val in props.items():
             if key.lower().strip() in [c.lower().strip() for c in DAO_PREV_TOTAL_CANDIDATES]:
                 try:
-                    if isinstance(val, dict):
-                        # formula: {"formula": {"number": 1215}} hoặc {"formula": {"string": "1215"}}
-                        if "formula" in val and isinstance(val["formula"], dict):
-                            fdata = val["formula"]
-                            if "number" in fdata and fdata["number"] is not None:
-                                prev_total_val = float(fdata["number"])
-                            elif "string" in fdata and fdata["string"]:
-                                try:
-                                    prev_total_val = float(str(fdata["string"]).replace(",", "").strip())
-                                except:
-                                    prev_total_val = None
-                        # number property
-                        elif "number" in val and val["number"] is not None:
-                            prev_total_val = float(val["number"])
-                        # rich_text fallback
-                        elif "rich_text" in val and isinstance(val["rich_text"], list) and val["rich_text"]:
-                            try:
-                                prev_total_val = float(val["rich_text"][0].get("plain_text", "").replace(",", "").strip())
-                            except:
-                                prev_total_val = None
+                    num = _try_float_from_formula_or_number(val)
+                    if num is not None:
+                        prev_total_val = num
+                        prev_total_key = key
+                        break
                 except Exception:
-                    # an error reading this property — skip and continue searching other keys
-                    prev_total_val = prev_total_val
-                prev_total_key = key
-                break
+                    pass
 
-        # --- Lấy cột "ngày trước" ---
+        # --- read prev_days (ngày trước) ---
         prev_days_key, prev_days_val = None, None
         for key, val in props.items():
             if key.lower().strip() in [c.lower().strip() for c in DAO_PREV_DAYS_CANDIDATES]:
                 try:
-                    if isinstance(val, dict):
-                        if "number" in val and val["number"] is not None:
-                            try:
-                                prev_days_val = int(val["number"])
-                            except:
-                                prev_days_val = None
-                        elif "formula" in val and isinstance(val["formula"], dict) and "number" in val["formula"]:
-                            try:
-                                prev_days_val = int(val["formula"]["number"])
-                            except:
-                                prev_days_val = None
+                    if isinstance(val, dict) and "number" in val and val["number"] is not None:
+                        prev_days_val = int(val["number"])
+                        prev_days_key = key
+                        break
                 except Exception:
-                    prev_days_val = prev_days_val
-                prev_days_key = key
-                break
+                    prev_days_val = None
 
-        # --- Lấy cột "G ngày" ---
+        # --- read per_day (G ngày) ---
         per_day_key, per_day_val = None, None
         for key, val in props.items():
             if key.lower().strip() in [c.lower().strip() for c in DAO_PERDAY_FIELD_CANDIDATES]:
                 try:
                     if isinstance(val, dict):
                         if "number" in val and val["number"] is not None:
-                            try:
-                                per_day_val = float(val["number"])
-                            except:
-                                per_day_val = None
-                        elif "formula" in val and isinstance(val["formula"], dict) and "number" in val["formula"]:
-                            try:
-                                per_day_val = float(val["formula"]["number"])
-                            except:
-                                per_day_val = None
+                            per_day_val = float(val["number"])
+                            per_day_key = key
+                            break
+                        if "formula" in val and isinstance(val["formula"], dict) and "number" in val["formula"]:
+                            per_day_val = float(val["formula"]["number"])
+                            per_day_key = key
+                            break
                 except Exception:
-                    per_day_val = per_day_val
-                per_day_key = key
-                break
+                    per_day_val = None
 
-        # Gán lại cho biến dùng phía sau (normalize)
-        try:
-            prev_total_val = float(prev_total_val) if prev_total_val is not None else None
-        except:
-            prev_total_val = None
-        try:
-            prev_days_val = int(prev_days_val) if prev_days_val is not None else None
-        except:
-            prev_days_val = None
+        # normalize per_day and fallback to legacy extractor as last resort
+        per_day = None
         try:
             per_day = float(per_day_val) if per_day_val is not None else None
-        except:
+        except Exception:
             per_day = None
+        if per_day is None:
+            per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
 
-        # --- Hàm trợ giúp nhỏ (đặt ngay sau, không nằm trong try) ---
-        def _try_float_from_formula_or_number(val_local):
-            """
-            Phụ trợ: parse giá trị từ property dict (formula.number, formula.string, number, rich_text)
-            Trả về float hoặc None.
-            """
-            try:
-                if not isinstance(val_local, dict):
-                    return None
-                if "formula" in val_local and isinstance(val_local["formula"], dict):
-                    f = val_local["formula"]
-                    if "number" in f and f["number"] is not None:
-                        return float(f["number"])
-                    if "string" in f and f["string"]:
-                        try:
-                            return float(str(f["string"]).replace(",", "").strip())
-                        except:
-                            return None
-                if "number" in val_local and val_local["number"] is not None:
-                    return float(val_local["number"])
-                if "rich_text" in val_local and isinstance(val_local["rich_text"], list) and val_local["rich_text"]:
-                    try:
-                        return float(val_local["rich_text"][0].get("plain_text", "").replace(",", "").strip())
-                    except:
-                        return None
-            except:
-                return None
-            return None
-
-
-                # --- Lấy giá trị tổng đáo / calc_total ---
+        # --- calc_total (read total / display_total) ---
         calc_total = None
         for key, val in props.items():
             if key.lower().strip() in [c.lower().strip() for c in DAO_TOTAL_FIELD_CANDIDATES]:
-                if isinstance(val, dict):
-                    # trường hợp là formula
-                    if "formula" in val and isinstance(val["formula"], dict):
-                        fdata = val["formula"]
-                        if "number" in fdata and fdata["number"] is not None:
-                            calc_total = float(fdata["number"])
-                        elif "string" in fdata and fdata["string"]:
-                            try:
-                                calc_total = float(fdata["string"].replace(",", "").strip())
-                            except:
-                                pass
-                    elif "number" in val and val["number"] is not None:
-                        calc_total = float(val["number"])
-                    elif "rich_text" in val and val["rich_text"]:
-                        try:
-                            calc_total = float(val["rich_text"][0]["plain_text"].replace(",", "").strip())
-                        except:
-                            pass
-                break
-                 # --- đảm bảo có display_total để preview (dùng calc_total nếu có, fallback prev_total) ---
-        try:
-            # Nếu đã đọc calc_total ở trên, dùng nó
-            display_total = calc_total if 'calc_total' in locals() and calc_total is not None else None
-        except:
-            display_total = None
-
-        # Nếu vẫn None thì thử lấy từ props (DAO_TOTAL_FIELD_CANDIDATES)
-        if display_total is None:
-            for key, val in props.items():
-                if key.lower().strip() in [c.lower().strip() for c in DAO_TOTAL_FIELD_CANDIDATES]:
-                    try:
-                        if isinstance(val, dict):
-                            if "number" in val and val["number"] is not None:
-                                display_total = float(val["number"])
-                            elif "formula" in val and isinstance(val["formula"], dict) and "number" in val["formula"]:
-                                display_total = float(val["formula"]["number"])
-                            elif "formula" in val and isinstance(val["formula"], dict) and "string" in val["formula"]:
-                                try:
-                                    display_total = float(str(val["formula"]["string"]).replace(",", "").strip())
-                                except:
-                                    display_total = None
-                            elif "rich_text" in val and val["rich_text"]:
-                                try:
-                                    display_total = float(val["rich_text"][0].get("plain_text","").replace(",", "").strip())
-                                except:
-                                    display_total = None
-                    except:
-                        display_total = None
-                    if display_total is not None:
+                try:
+                    num = _try_float_from_formula_or_number(val)
+                    if num is not None:
+                        calc_total = num
                         break
-
-        # Cuối cùng fallback: dùng prev_total_val (nếu có) hoặc 0
-        if display_total is None:
-            display_total = prev_total_val if prev_total_val is not None else (calc_total if 'calc_total' in locals() and calc_total is not None else 0)
-   
-
-        # fallback nếu vẫn None, dùng prev_total_val làm calc_total
+                except Exception:
+                    pass
+        # fallback: if calc_total missing, use prev_total_val
         if calc_total is None and prev_total_val is not None:
             calc_total = prev_total_val
 
-        if per_day is None:
-            per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
+        # ensure per_day is valid
         if per_day is None or per_day == 0:
-            send_telegram(chat_id, f"⚠️ Không tìm thấy hoặc per_day = 0. Kiểm tra cột phần/ngày trên page {preview}.")
-            return
-        if calc_total is None:
-            send_telegram(chat_id, f"⚠️ Không tìm thấy total trên page {preview}.")
+            send_telegram(chat_id, f"⚠️ Không tìm thấy hoặc per_day = 0. Kiểm tra cột 'G ngày' trên page {preview}.")
             return
 
-        # Determine number of days to create:
+        # determine days to create
         if prev_total_val is not None and prev_days_val is not None:
             days_to_create = int(prev_days_val)
         else:
-            days_to_create = int(math.ceil(calc_total / per_day))
+            try:
+                days_to_create = int(math.ceil((calc_total or 0) / per_day))
+            except Exception:
+                days_to_create = 0
 
         if days_to_create <= 0:
             send_telegram(chat_id, f"⚠️ Kết quả days không hợp lệ: {days_to_create}.")
@@ -1274,6 +1191,10 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
             send_telegram(chat_id, f"⚠️ Số ngày ({days_to_create}) vượt mức tối đa ({DAO_MAX_DAYS}). Hãy giảm hoặc thay đổi per_day.")
             return
 
+        # prepare display_total for preview
+        display_total = calc_total if calc_total is not None else (prev_total_val if prev_total_val is not None else 0)
+
+        # build preview text (start from tomorrow)
         start_dt = datetime.now()
         preview_text = build_dao_preview_text(
             preview,
@@ -1283,10 +1204,10 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
             start_dt,
             calc_total,
             prev_total=prev_total_val,
-            prev_days=int(prev_days_val) if prev_days_val is not None else None,
+            prev_days=prev_days_val,
             prev_total_key=prev_total_key,
             prev_days_key=prev_days_key,
-            per_day_key="G ngày"
+            per_day_key=per_day_key
         )
 
         pending_confirm[str(chat_id)] = {
@@ -1319,6 +1240,7 @@ def handle_incoming_message(chat_id: str, text: str):
             send_telegram(chat_id, "Vui lòng gửi lệnh hoặc từ khoá.")
             return
         low = raw.lower()
+        # if a pending confirm exists, let process handle it
         if str(chat_id) in pending_confirm:
             if low in ("/cancel", "cancel", "hủy", "huy"):
                 del pending_confirm[str(chat_id)]
@@ -1328,6 +1250,7 @@ def handle_incoming_message(chat_id: str, text: str):
                 send_telegram(chat_id, "Đang xử lý lựa chọn...")
                 threading.Thread(target=process_pending_selection, args=(chat_id, raw), daemon=True).start()
                 return
+            # if other text, drop to normal parsing
             del pending_confirm[str(chat_id)]
         if low in ("/cancel", "cancel", "hủy", "huy"):
             send_telegram(chat_id, "Không có thao tác đang chờ. /cancel ignored.")
@@ -1375,4 +1298,5 @@ def home():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
+    # dev server only for local testing; use gunicorn on Render
     app.run(host='0.0.0.0', port=port)
