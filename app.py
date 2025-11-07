@@ -1071,14 +1071,124 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
             send_telegram(chat_id, f"🔴 chưa thể đáo cho {preview}.")
             return
 
-        display_total = extract_number_from_prop(props, DAO_TOTAL_FIELD_CANDIDATES)
-        per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
-        calc_total = extract_number_from_prop(props, DAO_CALC_TOTAL_FIELDS) or display_total
+                # --- Lấy giá trị "trước" chính xác từ Notion (bao gồm cả formula) ---
+        prev_total_key, prev_total_val = None, None
+        for key, val in props.items():
+            if key.lower().strip() in [c.lower().strip() for c in DAO_PREV_TOTAL_CANDIDATES]:
+                try:
+                    if isinstance(val, dict):
+                        # formula: {"formula": {"number": 1215}} hoặc {"formula": {"string": "1215"}}
+                        if "formula" in val and isinstance(val["formula"], dict):
+                            fdata = val["formula"]
+                            if "number" in fdata and fdata["number"] is not None:
+                                prev_total_val = float(fdata["number"])
+                            elif "string" in fdata and fdata["string"]:
+                                try:
+                                    prev_total_val = float(str(fdata["string"]).replace(",", "").strip())
+                                except:
+                                    prev_total_val = None
+                        # number property
+                        elif "number" in val and val["number"] is not None:
+                            prev_total_val = float(val["number"])
+                        # rich_text fallback
+                        elif "rich_text" in val and isinstance(val["rich_text"], list) and val["rich_text"]:
+                            try:
+                                prev_total_val = float(val["rich_text"][0].get("plain_text", "").replace(",", "").strip())
+                            except:
+                                prev_total_val = None
+                except Exception:
+                    # an error reading this property — skip and continue searching other keys
+                    prev_total_val = prev_total_val
+                prev_total_key = key
+                break
 
-        prev_total_key, prev_total_val = find_prop_key_and_number(props, DAO_PREV_TOTAL_CANDIDATES)
-        prev_days_key, prev_days_val = find_prop_key_and_number(props, DAO_PREV_DAYS_CANDIDATES)
-        if prev_total_val is None:
-            prev_total_val = extract_number_from_prop(props, DAO_PREV_TOTAL_CANDIDATES)
+        # --- Lấy cột "ngày trước" ---
+        prev_days_key, prev_days_val = None, None
+        for key, val in props.items():
+            if key.lower().strip() in [c.lower().strip() for c in DAO_PREV_DAYS_CANDIDATES]:
+                try:
+                    if isinstance(val, dict):
+                        if "number" in val and val["number"] is not None:
+                            try:
+                                prev_days_val = int(val["number"])
+                            except:
+                                prev_days_val = None
+                        elif "formula" in val and isinstance(val["formula"], dict) and "number" in val["formula"]:
+                            try:
+                                prev_days_val = int(val["formula"]["number"])
+                            except:
+                                prev_days_val = None
+                except Exception:
+                    prev_days_val = prev_days_val
+                prev_days_key = key
+                break
+
+        # --- Lấy cột "G ngày" ---
+        per_day_key, per_day_val = None, None
+        for key, val in props.items():
+            if key.lower().strip() in [c.lower().strip() for c in DAO_PERDAY_FIELD_CANDIDATES]:
+                try:
+                    if isinstance(val, dict):
+                        if "number" in val and val["number"] is not None:
+                            try:
+                                per_day_val = float(val["number"])
+                            except:
+                                per_day_val = None
+                        elif "formula" in val and isinstance(val["formula"], dict) and "number" in val["formula"]:
+                            try:
+                                per_day_val = float(val["formula"]["number"])
+                            except:
+                                per_day_val = None
+                except Exception:
+                    per_day_val = per_day_val
+                per_day_key = key
+                break
+
+        # Gán lại cho biến dùng phía sau (normalize)
+        try:
+            prev_total_val = float(prev_total_val) if prev_total_val is not None else None
+        except:
+            prev_total_val = None
+        try:
+            prev_days_val = int(prev_days_val) if prev_days_val is not None else None
+        except:
+            prev_days_val = None
+        try:
+            per_day = float(per_day_val) if per_day_val is not None else None
+        except:
+            per_day = None
+
+        # --- Hàm trợ giúp nhỏ (đặt ngay sau, không nằm trong try) ---
+        def _try_float_from_formula_or_number(val_local):
+            """
+            Phụ trợ: parse giá trị từ property dict (formula.number, formula.string, number, rich_text)
+            Trả về float hoặc None.
+            """
+            try:
+                if not isinstance(val_local, dict):
+                    return None
+                if "formula" in val_local and isinstance(val_local["formula"], dict):
+                    f = val_local["formula"]
+                    if "number" in f and f["number"] is not None:
+                        return float(f["number"])
+                    if "string" in f and f["string"]:
+                        try:
+                            return float(str(f["string"]).replace(",", "").strip())
+                        except:
+                            return None
+                if "number" in val_local and val_local["number"] is not None:
+                    return float(val_local["number"])
+                if "rich_text" in val_local and isinstance(val_local["rich_text"], list) and val_local["rich_text"]:
+                    try:
+                        return float(val_local["rich_text"][0].get("plain_text", "").replace(",", "").strip())
+                    except:
+                        return None
+            except:
+                return None
+            return None
+
+
+        
         if per_day is None:
             per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
         if per_day is None or per_day == 0:
