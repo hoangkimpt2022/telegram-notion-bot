@@ -1188,7 +1188,34 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
             return None
 
 
-        
+                # --- Lấy giá trị tổng đáo / calc_total ---
+        calc_total = None
+        for key, val in props.items():
+            if key.lower().strip() in [c.lower().strip() for c in DAO_TOTAL_FIELD_CANDIDATES]:
+                if isinstance(val, dict):
+                    # trường hợp là formula
+                    if "formula" in val and isinstance(val["formula"], dict):
+                        fdata = val["formula"]
+                        if "number" in fdata and fdata["number"] is not None:
+                            calc_total = float(fdata["number"])
+                        elif "string" in fdata and fdata["string"]:
+                            try:
+                                calc_total = float(fdata["string"].replace(",", "").strip())
+                            except:
+                                pass
+                    elif "number" in val and val["number"] is not None:
+                        calc_total = float(val["number"])
+                    elif "rich_text" in val and val["rich_text"]:
+                        try:
+                            calc_total = float(val["rich_text"][0]["plain_text"].replace(",", "").strip())
+                        except:
+                            pass
+                break
+
+        # fallback nếu vẫn None, dùng prev_total_val làm calc_total
+        if calc_total is None and prev_total_val is not None:
+            calc_total = prev_total_val
+
         if per_day is None:
             per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
         if per_day is None or per_day == 0:
