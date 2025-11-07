@@ -1071,15 +1071,10 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
             send_telegram(chat_id, f"🔴 chưa thể đáo cho {preview}.")
             return
 
-        display_total = extract_number_from_prop(props, DAO_TOTAL_FIELD_CANDIDATES)
-        per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
-        calc_total = extract_number_from_prop(props, DAO_CALC_TOTAL_FIELDS) or display_total
-
                 # --- Lấy giá trị "trước" chính xác từ Notion (bao gồm cả formula) ---
         prev_total_key, prev_total_val = None, None
         for key, val in props.items():
             if key.lower().strip() in [c.lower().strip() for c in DAO_PREV_TOTAL_CANDIDATES]:
-                # Kiểm tra kiểu formula (Notion trả về: {"formula": {"number": 1215}} hoặc {"formula": {"string": "1215"}})
                 if isinstance(val, dict):
                     if "formula" in val:
                         fdata = val["formula"]
@@ -1105,10 +1100,17 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
         prev_days_key, prev_days_val = None, None
         for key, val in props.items():
             if key.lower().strip() in [c.lower().strip() for c in DAO_PREV_DAYS_CANDIDATES]:
-                if "number" in val and val["number"] is not None:
-                    prev_days_val = int(val["number"])
-                elif "formula" in val and "number" in val["formula"]:
-                    prev_days_val = int(val["formula"]["number"])
+                if isinstance(val, dict):
+                    if "number" in val and val["number"] is not None:
+                        try:
+                            prev_days_val = int(val["number"])
+                        except:
+                            prev_days_val = None
+                    elif "formula" in val and isinstance(val["formula"], dict) and "number" in val["formula"]:
+                        try:
+                            prev_days_val = int(val["formula"]["number"])
+                        except:
+                            prev_days_val = None
                 prev_days_key = key
                 break
 
@@ -1116,10 +1118,17 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
         per_day_key, per_day_val = None, None
         for key, val in props.items():
             if key.lower().strip() in [c.lower().strip() for c in DAO_PERDAY_FIELD_CANDIDATES]:
-                if "number" in val and val["number"] is not None:
-                    per_day_val = float(val["number"])
-                elif "formula" in val and "number" in val["formula"]:
-                    per_day_val = float(val["formula"]["number"])
+                if isinstance(val, dict):
+                    if "number" in val and val["number"] is not None:
+                        try:
+                            per_day_val = float(val["number"])
+                        except:
+                            per_day_val = None
+                    elif "formula" in val and isinstance(val["formula"], dict) and "number" in val["formula"]:
+                        try:
+                            per_day_val = float(val["formula"]["number"])
+                        except:
+                            per_day_val = None
                 per_day_key = key
                 break
 
