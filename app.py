@@ -1211,6 +1211,42 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
                         except:
                             pass
                 break
+                 # --- đảm bảo có display_total để preview (dùng calc_total nếu có, fallback prev_total) ---
+        try:
+            # Nếu đã đọc calc_total ở trên, dùng nó
+            display_total = calc_total if 'calc_total' in locals() and calc_total is not None else None
+        except:
+            display_total = None
+
+        # Nếu vẫn None thì thử lấy từ props (DAO_TOTAL_FIELD_CANDIDATES)
+        if display_total is None:
+            for key, val in props.items():
+                if key.lower().strip() in [c.lower().strip() for c in DAO_TOTAL_FIELD_CANDIDATES]:
+                    try:
+                        if isinstance(val, dict):
+                            if "number" in val and val["number"] is not None:
+                                display_total = float(val["number"])
+                            elif "formula" in val and isinstance(val["formula"], dict) and "number" in val["formula"]:
+                                display_total = float(val["formula"]["number"])
+                            elif "formula" in val and isinstance(val["formula"], dict) and "string" in val["formula"]:
+                                try:
+                                    display_total = float(str(val["formula"]["string"]).replace(",", "").strip())
+                                except:
+                                    display_total = None
+                            elif "rich_text" in val and val["rich_text"]:
+                                try:
+                                    display_total = float(val["rich_text"][0].get("plain_text","").replace(",", "").strip())
+                                except:
+                                    display_total = None
+                    except:
+                        display_total = None
+                    if display_total is not None:
+                        break
+
+        # Cuối cùng fallback: dùng prev_total_val (nếu có) hoặc 0
+        if display_total is None:
+            display_total = prev_total_val if prev_total_val is not None else (calc_total if 'calc_total' in locals() and calc_total is not None else 0)
+   
 
         # fallback nếu vẫn None, dùng prev_total_val làm calc_total
         if calc_total is None and prev_total_val is not None:
