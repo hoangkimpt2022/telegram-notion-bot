@@ -42,7 +42,7 @@ DATE_PROP_NAME = os.getenv("DATE_PROP_NAME", "Ngày Góp")
 # DAO config & candidate column names
 DAO_CONFIRM_TIMEOUT = int(os.getenv("DAO_CONFIRM_TIMEOUT", 120))
 DAO_MAX_DAYS = int(os.getenv("DAO_MAX_DAYS", 40))
-DAO_TOTAL_FIELD_CANDIDATES = os.getenv("DAO_TOTAL_FIELDS", "✅Đáo/thối,total,pre,tong,Σ").split(",")
+DAO_TOTAL_FIELD_CANDIDATES = ["✅Đáo/thối","Đáo/thối","Đáo thối","total","tong","pre","Σ"]
 DAO_CALC_TOTAL_FIELDS = ["trước", "prev_total", "pre", "# trước"]
 DAO_PERDAY_FIELD_CANDIDATES = os.getenv("DAO_PERDAY_FIELDS", "G ngày,per_day,perday,trước /ngày,Q G ngày").split(",")
 DAO_CHECKFIELD_CANDIDATES = os.getenv("DAO_CHECK_FIELDS", "Đáo/Thối,Đáo,Đáo Thối,dao,daothoi,✅Đáo/thối").split(",")
