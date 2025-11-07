@@ -48,6 +48,10 @@ DAO_TOTAL_FIELD_CANDIDATES = os.getenv("DAO_TOTAL_FIELDS", "✅Đáo/thối,tota
 DAO_CALC_TOTAL_FIELDS = ["trước", "pre", "# trước"]
 DAO_PERDAY_FIELD_CANDIDATES = os.getenv("DAO_PERDAY_FIELDS", "G ngày,per_day,perday,trước /ngày,Q G ngày").split(",")
 DAO_CHECKFIELD_CANDIDATES = os.getenv("DAO_CHECK_FIELDS", "Đáo/Thối,Đáo,Đáo Thối,dao,daothoi").split(",")
+# Additional candidates to extract prev-days and prev-total (thêm vào phần cấu hình DAO)
+DAO_PREV_TOTAL_CANDIDATES = ["trước", "pre", "prev", "prev_total", "for_pre", "forua"]
+DAO_PREV_DAYS_CANDIDATES  = ["ngày trước", "ngày_trước", "ngay trước", "ngay_truoc", "days_before", "prev_days"]
+
 # Operational settings
 WAIT_CONFIRM = int(os.getenv("WAIT_CONFIRM", 120))
 NOTION_PAGE_SIZE = int(os.getenv("NOTION_PAGE_SIZE", 100))
