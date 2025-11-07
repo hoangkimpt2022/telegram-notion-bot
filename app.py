@@ -524,14 +524,52 @@ def check_checkfield_has_check(props: dict, candidates: List[str]) -> bool:
             return True
     return False
 
-def build_dao_preview_text(name: str, display_total: Optional[float], per_day: Optional[float], days: int, start_date: datetime, calc_total: Optional[float]) -> str:
+def build_dao_preview_text(name: str,
+                           display_total: Optional[float],
+                           per_day: Optional[float],
+                           days: int,
+                           start_date: datetime,
+                           calc_total: Optional[float],
+                           prev_total: Optional[float] = None,
+                           prev_days: Optional[int] = None,
+                           prev_total_key: Optional[str] = None,
+                           prev_days_key: Optional[str] = None,
+                           per_day_key: Optional[str] = None) -> str:
+    """
+    Xây preview text cho flow đáo:
+    - Nếu prev_total được cung cấp -> in 'Lấy trước: {prev_days} ngày {per_day} là {prev_total}'
+    - Ngược lại in 'Không Lấy trước'
+    - Bắt đầu danh sách từ NGÀY MAI (start_date + 1 day)
+    - days: số ngày thực tế sẽ tạo (đã được tính trước)
+    """
     lines = []
-    lines.append(f"🔔 đáo lại cho: {name} - Tổng đáo: ✅ {int(display_total) if display_total is not None else display_total}")
-    lines.append(f"Lấy trước: {days} ngày {int(per_day) if per_day is not None else per_day} | {int(calc_total) if calc_total is not None else calc_total}")
-    lines.append("")
-    lines.append("Danh sách ngày dự kiến tạo (bắt đầu từ hôm nay):")
+    # Status line
+    disp_total = int(display_total) if display_total is not None else display_total
+    lines.append(f"🔔 đáo lại cho: {name} - Tổng đáo: ✅ {disp_total}")
+
+    # prev / lấy trước
+    if prev_total is None or (isinstance(prev_total, (int, float)) and prev_total == 0):
+        lines.append("Không Lấy trước")
+    else:
+        pd = int(prev_days) if prev_days is not None else "?"
+        per_day_disp = int(per_day) if per_day is not None else per_day
+        lines.append(f"Lấy trước: {pd} ngày {per_day_disp} là {int(prev_total)}")
+        extra_parts = []
+        if prev_total_key:
+            extra_parts.append(f"trong đó cột \"{prev_total_key}\" là Forula")
+        if prev_days_key:
+            extra_parts.append(f"{prev_days_key} là cột \"ngày trước\"")
+        if per_day_key:
+            extra_parts.append(f"{per_day_key} là cột \"G ngày\"")
+        if extra_parts:
+            lines.append("(" + "; ".join(extra_parts) + ")")
+
+    lines.append("")  # blank
+    lines.append("Danh sách ngày dự kiến tạo (bắt đầu từ ngày mai):")
+    # start from tomorrow
+    start_from = (start_date.date() + timedelta(days=1))
     for i in range(days):
-        dt = start_date.date() + timedelta(days=i)
+        dt = start_from + timedelta(days=i)
         lines.append(f"{i+1}. {dt.isoformat()}")
     lines.append("")
     lines.append(f"Gửi 'ok' để tạo {days} page, hoặc 'cancel' để hủy.")
@@ -1033,32 +1071,41 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
         prev_total_key, prev_total_val = find_prop_key_and_number(props, DAO_PREV_TOTAL_CANDIDATES)
         prev_days_key, prev_days_val = find_prop_key_and_number(props, DAO_PREV_DAYS_CANDIDATES)
         # If prev_total was not found by name candidates, also try to read column literally named "trước"
-        if prev_total_val is None:
-            prev_total_val = extract_number_from_prop(props, DAO_PREV_TOTAL_CANDIDATES)
-        if per_day is None:
-            per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
-        if per_day is None:
-            send_telegram(chat_id, f"⚠️ Không tìm thấy hoặc per_day = 0. Kiểm tra cột phần/ngày trên page {preview}.")
-            return
-        if calc_total is None:
-            send_telegram(chat_id, f"⚠️ Không tìm thấy total trên page {preview}.")
-            return
+                # --- sau khi đã lấy display_total, per_day, calc_total, prev_total_val, prev_days_val ---
+        # Determine number of days to create:
+        if prev_total_val is not None and prev_days_val is not None:
+            # Nếu có 'trước' và 'ngày trước' -> dùng số ngày từ prev_days_val
+            days_to_create = int(prev_days_val)
+        else:
+            # Nếu không có prev, fallback: tính từ tổng / per_day
+            days_to_create = int(math.ceil(calc_total / per_day))
 
-        days = int(math.ceil(calc_total / per_day))
-        if days <= 0:
-            send_telegram(chat_id, f"⚠️ Kết quả days không hợp lệ: {days}.")
+        if days_to_create <= 0:
+            send_telegram(chat_id, f"⚠️ Kết quả days không hợp lệ: {days_to_create}.")
             return
-        if days > DAO_MAX_DAYS:
-            send_telegram(chat_id, f"⚠️ Số ngày ({days}) vượt mức tối đa ({DAO_MAX_DAYS}). Hãy giảm hoặc thay đổi per_day.")
+        if days_to_create > DAO_MAX_DAYS:
+            send_telegram(chat_id, f"⚠️ Số ngày ({days_to_create}) vượt mức tối đa ({DAO_MAX_DAYS}). Hãy giảm hoặc thay đổi per_day.")
             return
 
         # Build preview: start_date = now (we will display "from tomorrow")
         start_dt = datetime.now()
-        # prev_days value should be integer if found
-        prev_days_int = int(prev_days_val) if prev_days_val is not None else None
 
-        # Build preview text with new rules
-        preview_text = build_dao_preview_text(preview, display_total, per_day, days, start_dt, calc_total)
+        # Build preview text with prev info passed so it prints Lấy trước correctly
+        preview_text = build_dao_preview_text(
+            preview,
+            display_total,
+            per_day,
+            days_to_create,
+            start_dt,
+            calc_total,
+            prev_total=prev_total_val,
+            prev_days=int(prev_days_val) if prev_days_val is not None else None,
+            prev_total_key=prev_total_key,
+            prev_days_key=prev_days_key,
+            per_day_key="G ngày"
+        )
+
+        # Lưu pending confirm (để khi user gõ ok/cancel)
         pending_confirm[str(chat_id)] = {
             "type": "dao_confirm",
             "keyword": keyword,
@@ -1067,17 +1114,14 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
             "display_total": display_total,
             "per_day": per_day,
             "calc_total": calc_total,
-            "days": days,
-            # store start_date as ISO date but note we will use tomorrow during creation
+            "days": days_to_create,
             "start_date": datetime.now().date().isoformat(),
             "expires": time.time() + DAO_CONFIRM_TIMEOUT,
             "orig_command": orig_cmd
         }
+
+        # Gửi preview
         send_long_text(chat_id, preview_text)
-    except Exception as e:
-        print("handle_command_dao exception:", e)
-        traceback.print_exc()
-        send_telegram(chat_id, f"❌ Lỗi xử lý dao: {str(e)}")
 
 # ---------------- Message handler ----------------
 def handle_incoming_message(chat_id: str, text: str):
