@@ -1075,59 +1075,12 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
         per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
         calc_total = extract_number_from_prop(props, DAO_CALC_TOTAL_FIELDS) or display_total
 
-        # --- Lấy giá trị "trước" chính xác từ Notion (bao gồm cả formula) ---
-prev_total_key, prev_total_val = None, None
-for key, val in props.items():
-    if key.lower().strip() in [c.lower().strip() for c in DAO_PREV_TOTAL_CANDIDATES]:
-        # Kiểm tra kiểu formula (Notion trả về: {"formula": {"number": 1215}} hoặc {"formula": {"string": "1215"}})
-        if isinstance(val, dict):
-            if "formula" in val:
-                fdata = val["formula"]
-                if isinstance(fdata, dict):
-                    if "number" in fdata and fdata["number"] is not None:
-                        prev_total_val = fdata["number"]
-                    elif "string" in fdata and fdata["string"]:
-                        try:
-                            prev_total_val = float(fdata["string"].replace(",", "").strip())
-                        except:
-                            prev_total_val = None
-            elif "number" in val and val["number"] is not None:
-                prev_total_val = val["number"]
-            elif "rich_text" in val and val["rich_text"]:
-                try:
-                    prev_total_val = float(val["rich_text"][0]["plain_text"].replace(",", "").strip())
-                except:
-                    pass
-        prev_total_key = key
-        break
-
-# --- Lấy cột "ngày trước" ---
-prev_days_key, prev_days_val = None, None
-for key, val in props.items():
-    if key.lower().strip() in [c.lower().strip() for c in DAO_PREV_DAYS_CANDIDATES]:
-        if "number" in val and val["number"] is not None:
-            prev_days_val = int(val["number"])
-        elif "formula" in val and "number" in val["formula"]:
-            prev_days_val = int(val["formula"]["number"])
-        prev_days_key = key
-        break
-
-# --- Lấy cột "G ngày" ---
-per_day_key, per_day_val = None, None
-for key, val in props.items():
-    if key.lower().strip() in [c.lower().strip() for c in DAO_PERDAY_FIELD_CANDIDATES]:
-        if "number" in val and val["number"] is not None:
-            per_day_val = float(val["number"])
-        elif "formula" in val and "number" in val["formula"]:
-            per_day_val = float(val["formula"]["number"])
-        per_day_key = key
-        break
-
-# Gán lại cho biến dùng phía sau
-prev_total_val = float(prev_total_val) if prev_total_val is not None else None
-prev_days_val = int(prev_days_val) if prev_days_val is not None else None
-per_day = float(per_day_val) if per_day_val is not None else None
-
+        prev_total_key, prev_total_val = find_prop_key_and_number(props, DAO_PREV_TOTAL_CANDIDATES)
+        prev_days_key, prev_days_val = find_prop_key_and_number(props, DAO_PREV_DAYS_CANDIDATES)
+        if prev_total_val is None:
+            prev_total_val = extract_number_from_prop(props, DAO_PREV_TOTAL_CANDIDATES)
+        if per_day is None:
+            per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
         if per_day is None or per_day == 0:
             send_telegram(chat_id, f"⚠️ Không tìm thấy hoặc per_day = 0. Kiểm tra cột phần/ngày trên page {preview}.")
             return
