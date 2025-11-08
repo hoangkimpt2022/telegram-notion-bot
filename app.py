@@ -204,8 +204,86 @@ def extract_plain_text_from_rich_text(arr) -> str:
     return "".join([chunk.get("plain_text", "") for chunk in arr if isinstance(chunk, dict)])
 
 def extract_prop_text(props: Dict[str, Any], key_name: str) -> str:
+    """
+    Trả về nội dung text/number của một property trong Notion (bao gồm hỗ trợ rollup, formula).
+    """
     if not props:
         return ""
+
+    # tìm key case-insensitive
+    key = None
+    for k in props:
+        if k.lower() == key_name.lower():
+            key = k
+            break
+    if not key:
+        for k in props:
+            if key_name.lower() in k.lower():
+                key = k
+                break
+    if not key:
+        return ""
+
+    prop = props.get(key, {})
+    ptype = prop.get("type")
+
+    # --- HANDLE FORMULA ---
+    if ptype == "formula":
+        formula = prop.get("formula", {})
+        if formula.get("type") == "number" and formula.get("number") is not None:
+            return str(formula.get("number"))
+        if formula.get("type") == "string" and formula.get("string"):
+            return formula.get("string")
+        if formula.get("type") == "boolean":
+            return str(formula.get("boolean"))
+        if formula.get("type") == "date" and formula.get("date"):
+            return formula["date"].get("start", "")
+        return ""
+
+    # --- HANDLE ROLLUP ---
+    if ptype == "rollup":
+        roll = prop.get("rollup", {})
+        roll_type = roll.get("type")
+
+        # direct number rollup
+        if roll_type == "number" and roll.get("number") is not None:
+            return str(roll.get("number"))
+
+        # rollup array (ví dụ nhiều giá trị)
+        if roll_type == "array":
+            arr = roll.get("array", [])
+            if arr and isinstance(arr[0], dict):
+                sub = arr[0]
+                # rollup array element có thể là number hoặc rich_text
+                if "number" in sub and sub["number"] is not None:
+                    return str(sub["number"])
+                if "plain_text" in sub:
+                    return sub["plain_text"]
+                if "title" in sub:
+                    return "".join(t.get("plain_text", "") for t in sub["title"])
+            return ""
+        return ""
+
+    # --- HANDLE CÁC KIỂU KHÁC ---
+    if ptype == "title":
+        return extract_plain_text_from_rich_text(prop.get("title", []))
+    if ptype == "rich_text":
+        return extract_plain_text_from_rich_text(prop.get("rich_text", []))
+    if ptype == "number":
+        return str(prop.get("number"))
+    if ptype == "select":
+        v = prop.get("select") or {}
+        return v.get("name", "")
+    if ptype == "multi_select":
+        arr = prop.get("multi_select") or []
+        return ", ".join([a.get("name", "") for a in arr])
+    if ptype == "date":
+        d = prop.get("date") or {}
+        return d.get("start", "")
+    if ptype == "checkbox":
+        return str(prop.get("checkbox"))
+    return ""
+
     # case-insensitive find
     key = None
     for k in props:
