@@ -85,6 +85,19 @@ def send_telegram(chat_id: int, text: str) -> bool:
     except Exception as e:
         print("send_telegram error:", e)
         return False
+def check_prop_exists(database_id: str, prop_name: str) -> bool:
+    """
+    Kiểm tra xem 1 property có tồn tại trong Notion database không.
+    """
+    try:
+        url = f"https://api.notion.com/v1/databases/{database_id}"
+        r = requests.get(url, headers=NOTION_HEADERS, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            return prop_name in data.get("properties", {})
+        return False
+    except Exception:
+        return False
 
 def send_long_text(chat_id: int, text: str):
     # Telegram limit ~4096, keep safe
@@ -400,8 +413,8 @@ def count_checked_unchecked(keyword: str) -> Tuple[int, int]:
 
 def build_preview_text_for_matches(keyword: str, matches: List[Tuple[str, str, Optional[str]]]) -> str:
     checked, unchecked = count_checked_unchecked(keyword)
-    header = f"🔎 : '{keyword}'\n✅ Đã tích: {checked}\n🟡 Chưa tích: {unchecked}\n"
-    header += f"📤 Gửi số ( ví dụ 1 hoặc 1-3 ) trong {WAIT_CONFIRM}s để chọn, hoặc /cancel.\n\n"
+    header = f"🔎 : '{keyword}'\n✅ Đã góp: {checked}\n🟡 Chưa góp: {unchecked}\n"
+    header += f"📤  {WAIT_CONFIRM} /cancel.\n"
     lines = []
     for i, (pid, title, date_iso) in enumerate(matches, start=1):
         ds = date_iso[:10] if date_iso else "-"
@@ -411,6 +424,12 @@ def build_preview_text_for_matches(keyword: str, matches: List[Tuple[str, str, O
 def mark_pages_by_indices(chat_id: int, keyword: str, matches: List[Tuple[str,str,Optional[str]]], indices: List[int]):
     succeeded = []
     failed = []
+
+    # Nếu user chỉ gõ 1 số (vd: 3) -> chọn 3 mục đầu tiên
+    if len(indices) == 1 and indices[0] > 1:
+        max_n = indices[0]
+        indices = list(range(1, min(max_n, len(matches)) + 1))
+
     for idx in indices:
         if idx < 1 or idx > len(matches):
             failed.append((idx, "index out of range"))
@@ -434,7 +453,7 @@ def mark_pages_by_indices(chat_id: int, keyword: str, matches: List[Tuple[str,st
                 "selected": [{"page_id": p, "title": t, "date": d} for p,t,d in succeeded], "failed": failed})
     # send summary
     if succeeded:
-        lines = [f"✅ Đã đánh dấu {len(succeeded)} mục:\n"]
+        lines = [f"🔎 : {keyword}✅ Đã đánh dấu {len(succeeded)} mục:\n"]
         for i,(p,t,d) in enumerate(succeeded, start=1):
             lines.append(f"{i}. [{d[:10] if d else '-'}] {t}")
         # sau khi đánh dấu xong, cập nhật lại số đếm
@@ -660,43 +679,9 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
             return
 
         # === 1️⃣ XÓA PAGE CŨ ===
-        all_pages = query_database_all(NOTION_DATABASE_ID, page_size=500)
-        kw = title.strip().lower()
-        filtered_matched = []
-
-        for p in all_pages:
-            props_p = p.get("properties", {})
-            name_p = extract_prop_text(props_p, "Name") or extract_prop_text(props_p, "Title") or ""
-            if kw not in name_p.lower():
-                continue
-            parent = p.get("parent", {})
-            if parent.get("database_id") and str(parent["database_id"]) != str(NOTION_DATABASE_ID):
-                continue
-            date_iso = None
-            date_key = find_prop_key(props_p, DATE_PROP_NAME)
-            if date_key and props_p.get(date_key, {}).get("date"):
-                date_iso = props_p[date_key]["date"].get("start")
-            filtered_matched.append((p.get("id"), name_p, date_iso))
-
-        total_to_delete = len(filtered_matched)
-        send_telegram(chat_id, f"🧹 Đang xóa {total_to_delete} ngày của {title} (check + uncheck)...")
-
-        deleted, failed_del = [], []
-        for idx, (pid, name_p, date_iso) in enumerate(filtered_matched, start=1):
-            send_progress(chat_id, idx, total_to_delete, f"🗑️ Đang xóa {title}")
-            try:
-                ok, msg = archive_page(pid)
-                if ok:
-                    deleted.append(pid)
-                else:
-                    failed_del.append((pid, msg))
-            except Exception as e:
-                failed_del.append((pid, str(e)))
-            time.sleep(PATCH_DELAY)
-
-        send_telegram(chat_id, f"✅ Đã xóa xong {len(deleted)}/{total_to_delete} mục của {title}.")
-        if failed_del:
-            send_telegram(chat_id, f"⚠️ Có {len(failed_del)} mục xóa lỗi, kiểm tra log.")
+        # === Gọi lại chức năng xóa có sẵn ===
+        send_telegram(chat_id, f"🧹 Đang archive toàn bộ page của {title} trước khi tạo mới...")
+        handle_command_archive(chat_id, title, None, f"{title} xóa")
 
         # === 2️⃣ TẠO PAGE MỚI ===
         start = datetime.now().date() + timedelta(days=1)
@@ -755,21 +740,55 @@ def create_lai_page(chat_id: int, title: str, lai_amount: float, relation_id: st
     """
     try:
         today = datetime.now().date().isoformat()
-        props_payload = {
-            "Name": {"title": [{"type": "text", "text": {"content": title}}]},
-            "Lãi": {"number": lai_amount},
-            "Ngày Lãi": {"date": {"start": today}},
-            "Lịch G": {"relation": [{"id": relation_id}]}
+
+        # kiểm tra xem LA_NOTION_DATABASE_ID có tồn tại
+        if not LA_NOTION_DATABASE_ID:
+            send_telegram(chat_id, "⚠️ LA_NOTION_DATABASE_ID chưa được thiết lập.")
+            return
+
+        # build payload linh hoạt: chỉ thêm field nếu database có cột đó
+        props_payload = {}
+
+        # Name
+        props_payload["Name"] = {
+            "title": [{"type": "text", "text": {"content": title}}]
         }
-        ok, res = create_page_in_db(LA_NOTION_DATABASE_ID, props_payload)
-        if ok:
+
+        # Lãi (chấp nhận 'Lai' hoặc 'Lãi')
+        field_name_lai = None
+        for f in ("Lãi", "Lai", "Lãi "):
+            if check_prop_exists(LA_NOTION_DATABASE_ID, f):
+                field_name_lai = f
+                break
+        if field_name_lai:
+            props_payload[field_name_lai] = {"number": lai_amount}
+        else:
+            send_telegram(chat_id, "⚠️ Không tìm thấy cột 'Lãi' hoặc 'Lai' trong DB Lãi.")
+
+        # Ngày Lãi
+        field_name_date = None
+        for f in ("Ngày Lãi", "Ngay Lãi", "Ngày lãi", "Ngay lai"):
+            if check_prop_exists(LA_NOTION_DATABASE_ID, f):
+                field_name_date = f
+                break
+        if field_name_date:
+            props_payload[field_name_date] = {"date": {"start": today}}
+
+        # Lịch G (relation)
+        props_payload["Lịch G"] = {"relation": [{"id": relation_id}]}
+
+        # gửi request tạo page
+        url = "https://api.notion.com/v1/pages"
+        body = {"parent": {"database_id": LA_NOTION_DATABASE_ID}, "properties": props_payload}
+        r = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=15)
+
+        if r.status_code in (200, 201):
             send_telegram(chat_id, f"💰 Đã tạo Lãi cho {title} ({lai_amount})")
         else:
-            send_telegram(chat_id, f"⚠️ Tạo Lãi lỗi: {res}")
+            send_telegram(chat_id, f"⚠️ Tạo Lãi lỗi: {r.status_code} - {r.text}")
+
     except Exception as e:
         send_telegram(chat_id, f"❌ Lỗi tạo Lãi cho {title}: {str(e)}")
-
-
 
 
 
@@ -795,7 +814,7 @@ def handle_text_message(chat_id: int, text: str):
     # archive command endswith ' xóa' or ' xoa'
     if low.endswith(" xóa") or low.endswith(" xoa"):
         kw = txt[:-4].strip()
-        matches = find_matching_all_pages_in_db(NOTION_DATABASE_ID, keyword, limit=500)
+        matches = find_matching_all_pages_in_db(NOTION_DATABASE_ID, keyword, limit=40)
         checked, unchecked = count_checked_unchecked(kw)
         header = f"🔎 Khách hàng: '{kw}'\n✅ Đã tích: {checked}\n🟡 Chưa tích: {unchecked}\n"
         header += f"⚠️ CHÚ Ý: Bạn sắp archive {len(matches)} mục chứa '{kw}'.\n\nGửi số (ví dụ 1-7) trong {WAIT_CONFIRM}s để chọn, hoặc /all để archive tất cả, hoặc /cancel.\n\n"
