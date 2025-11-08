@@ -627,30 +627,27 @@ def send_progress(chat_id: int, step: int, total: int, label: str):
     try:
         if total == 0:
             return
-        # chỉ gửi khi là bước đầu, mỗi 10 bước, hoặc bước cuối
         if step == 1 or step % 10 == 0 or step == total:
             send_telegram(chat_id, f"⏱️ {label}: {step}/{total} ...")
     except Exception as e:
         print("send_progress error:", e)
 
+
 def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[str, Any]):
     """
     Xử lý đáo:
-     - archive (xóa) toàn bộ page của 'key' trong NOTION_DATABASE_ID (checked + unchecked)
-     - tạo `take_days` page mới bắt đầu từ ngày mai, mỗi page có Đã Góp = True (theo yêu cầu)
-     - tạo 1 page Lãi trong LA_NOTION_DATABASE_ID (nếu LA_NOTION_DATABASE_ID set và có giá trị Lãi)
-     - báo progress chi tiết về Telegram
+     - Xóa toàn bộ page cũ có tên trùng trong NOTION_DATABASE_ID (checked + unchecked)
+     - Tạo `take_days` page mới (ngày mai bắt đầu), mỗi page có Đã Góp=True
+     - Tạo page Lãi trong LA_NOTION_DATABASE_ID nếu có
     """
     try:
         title = extract_prop_text(props, "Name") or "UNKNOWN"
         total_text = extract_prop_text(props, "Đáo/thối")
         total_val = parse_money_from_text(total_text) or 0
-
         per_day = parse_money_from_text(extract_prop_text(props, "G ngày")) or 0
         days_before = parse_money_from_text(extract_prop_text(props, "ngày trước")) or 0
         pre_amount = parse_money_from_text(extract_prop_text(props, "trước")) or 0
 
-        # tính số ngày cần tạo
         if pre_amount == 0:
             send_telegram(chat_id, f"🔔 đáo lại cho: {title} - Tổng đáo: ✅ {int(total_val) if total_val else 'N/A'}\n\nKhông Lấy trước")
             return
@@ -659,67 +656,53 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
             int(math.ceil(pre_amount / per_day)) if per_day else 0
         )
         if take_days <= 0:
-            send_telegram(chat_id, f"⚠️ Không xác định được số ngày hợp lệ cho {title} (per_day={per_day}, pre_amount={pre_amount}, days_before={days_before})")
+            send_telegram(chat_id, f"⚠️ Không xác định được số ngày hợp lệ cho {title}")
             return
 
-    # --- CHUẨN HÓA: chỉ xóa page có parent.database_id == NOTION_DATABASE_ID ---
-filtered_matched = []
+        # === 1️⃣ XÓA PAGE CŨ ===
+        all_pages = query_database_all(NOTION_DATABASE_ID, page_size=500)
+        kw = title.strip().lower()
+        filtered_matched = []
 
-for p in all_pages:
-    # lấy id/name/date giống logic matched trước đó
-    props_p = p.get("properties", {})
-    name_p = extract_prop_text(props_p, "Name") or extract_prop_text(props_p, "Title") or ""
-    if kw not in name_p.lower():
-        continue
+        for p in all_pages:
+            props_p = p.get("properties", {})
+            name_p = extract_prop_text(props_p, "Name") or extract_prop_text(props_p, "Title") or ""
+            if kw not in name_p.lower():
+                continue
+            parent = p.get("parent", {})
+            if parent.get("database_id") and str(parent["database_id"]) != str(NOTION_DATABASE_ID):
+                continue
+            date_iso = None
+            date_key = find_prop_key(props_p, DATE_PROP_NAME)
+            if date_key and props_p.get(date_key, {}).get("date"):
+                date_iso = props_p[date_key]["date"].get("start")
+            filtered_matched.append((p.get("id"), name_p, date_iso))
 
-    # kiểm tra parent (chỉ giữ page thuộc NOTION_DATABASE_ID)
-    parent = p.get("parent", {})
-    parent_db = parent.get("database_id")
-    if parent_db and str(parent_db) != str(NOTION_DATABASE_ID):
-        continue
+        total_to_delete = len(filtered_matched)
+        send_telegram(chat_id, f"🧹 Đang xóa {total_to_delete} ngày của {title} (check + uncheck)...")
 
-    # lấy ngày (nếu có)
-    date_iso = None
-    date_key = find_prop_key(props_p, DATE_PROP_NAME)
-    if date_key and props_p.get(date_key, {}).get("date"):
-        date_iso = props_p[date_key]["date"].get("start")
+        deleted, failed_del = [], []
+        for idx, (pid, name_p, date_iso) in enumerate(filtered_matched, start=1):
+            send_progress(chat_id, idx, total_to_delete, f"🗑️ Đang xóa {title}")
+            try:
+                ok, msg = archive_page(pid)
+                if ok:
+                    deleted.append(pid)
+                else:
+                    failed_del.append((pid, msg))
+            except Exception as e:
+                failed_del.append((pid, str(e)))
+            time.sleep(PATCH_DELAY)
 
-    filtered_matched.append((p.get("id"), name_p, date_iso))
+        send_telegram(chat_id, f"✅ Đã xóa xong {len(deleted)}/{total_to_delete} mục của {title}.")
+        if failed_del:
+            send_telegram(chat_id, f"⚠️ Có {len(failed_del)} mục xóa lỗi, kiểm tra log.")
 
-total_to_delete = len(filtered_matched)
-send_telegram(chat_id, f"🧹 Đang xóa {total_to_delete} ngày của {title} (check + uncheck) trong DB chính...")
-
-deleted, failed_del = [], []
-
-# bắt đầu vòng lặp xoá từng page
-for idx, (pid, name_p, date_iso) in enumerate(filtered_matched, start=1):
-    send_progress(chat_id, idx, total_to_delete, f"🗑️ Đang xóa {title}")
-
-    try:
-        ok, msg = archive_page(pid)
-        if ok:
-            deleted.append(pid)
-        else:
-            failed_del.append((pid, msg))
-    except Exception as e:
-        failed_del.append((pid, str(e)))
-
-    time.sleep(PATCH_DELAY)
-
-send_telegram(chat_id, f"✅ Đã xóa xong {len(deleted)}/{total_to_delete} mục của {title} trong {NOTION_DATABASE_ID}.")
-
-if failed_del:
-    send_telegram(chat_id, f"⚠️ Có {len(failed_del)} mục xóa lỗi. Xem logs để debug.")
-    for err_pid, err_msg in failed_del[:10]:
-        send_telegram(chat_id, f"- {err_pid}: {err_msg}")
-   
-
-
-        # 2️⃣ TẠO PAGE MỚI
+        # === 2️⃣ TẠO PAGE MỚI ===
         start = datetime.now().date() + timedelta(days=1)
         created = []
-        failed_create = []
-        send_telegram(chat_id, f"🛠️ Đang tạo {take_days} ngày mới cho {title} bắt đầu từ ngày mai...")
+        send_telegram(chat_id, f"🛠️ Đang tạo {take_days} ngày mới cho {title} (bắt đầu từ ngày mai)...")
+
         for count in range(1, take_days + 1):
             d = start + timedelta(days=(count - 1))
             props_payload = {
@@ -727,38 +710,38 @@ if failed_del:
                 DATE_PROP_NAME: {"date": {"start": d.isoformat()}},
                 "Tiền": {"number": per_day} if per_day else {},
                 CHECKBOX_PROP: {"checkbox": True},
-                "Lịch G": {"relation": [{"id": source_page_id}]},
+                "Lịch G": {"relation": [{"id": source_page_id}]}
             }
-            clean_props = {k: v for k, v in props_payload.items() if v and not (isinstance(v, dict) and v == {})}
+            clean_props = {k: v for k, v in props_payload.items() if v}
             try:
-                url = "https://api.notion.com/v1/pages"
-                body = {"parent": {"database_id": NOTION_DATABASE_ID}, "properties": clean_props}
-                r = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=20)
-                if r.status_code in (200, 201):
-                    created.append(r.json())
+                ok, res = create_page_in_db(NOTION_DATABASE_ID, clean_props)
+                if ok:
+                    created.append(res)
+                    send_progress(chat_id, count, take_days, f"📅 Đang tạo ngày mới cho {title}")
                 else:
-                    failed_create.append(f"{r.status_code}: {r.text}")
-                send_progress(chat_id, count, take_days, f"📅 Đang tạo ngày mới cho {title}")
+                    send_telegram(chat_id, f"⚠️ Tạo lỗi: {res}")
             except Exception as e:
-                failed_create.append(str(e))
+                send_telegram(chat_id, f"⚠️ Tạo lỗi: {str(e)}")
             time.sleep(PATCH_DELAY)
 
-        send_telegram(chat_id, f"✅ Đã tạo {len(created)} ngày mới cho {title} (page mới đã check 'Đã Góp').")
+        send_telegram(chat_id, f"✅ Đã tạo {len(created)} ngày mới cho {title} (đã check 'Đã Góp').")
 
-        # 3️⃣ TẠO PAGE LÃI
+        # === 3️⃣ TẠO PAGE LÃI ===
         lai_text = extract_prop_text(props, "Lai") or extract_prop_text(props, "Lãi") or ""
         lai_amt = parse_money_from_text(lai_text) or 0
         if LA_NOTION_DATABASE_ID and lai_amt > 0:
             send_telegram(chat_id, f"💸 Tiếp tục tạo Lãi cho {title}...")
-            relation_target_id = created[0].get("id", source_page_id) if created else source_page_id
+            relation_target_id = created[0]["id"] if created else source_page_id
             create_lai_page(chat_id, title, lai_amt, relation_target_id)
         else:
             send_telegram(chat_id, f"ℹ️ Không có giá trị Lãi hoặc LA_NOTION_DATABASE_ID chưa cài đặt.")
 
+        send_telegram(chat_id, f"✅ Hoàn tất tiến trình đáo cho {title}.")
         return
+
     except Exception as e:
-        send_telegram(chat_id, f"❌ Lỗi tiến trình đáo cho {title}: {str(e)}")
         traceback.print_exc()
+        send_telegram(chat_id, f"❌ Lỗi tiến trình đáo cho {title}: {str(e)}")
         return
 
 
@@ -778,15 +761,14 @@ def create_lai_page(chat_id: int, title: str, lai_amount: float, relation_id: st
             "Ngày Lãi": {"date": {"start": today}},
             "Lịch G": {"relation": [{"id": relation_id}]}
         }
-        url = "https://api.notion.com/v1/pages"
-        body = {"parent": {"database_id": LA_NOTION_DATABASE_ID}, "properties": props_payload}
-        r = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=15)
-        if r.status_code in (200, 201):
+        ok, res = create_page_in_db(LA_NOTION_DATABASE_ID, props_payload)
+        if ok:
             send_telegram(chat_id, f"💰 Đã tạo Lãi cho {title} ({lai_amount})")
         else:
-            send_telegram(chat_id, f"⚠️ Tạo Lãi lỗi: {r.status_code} - {r.text}")
+            send_telegram(chat_id, f"⚠️ Tạo Lãi lỗi: {res}")
     except Exception as e:
         send_telegram(chat_id, f"❌ Lỗi tạo Lãi cho {title}: {str(e)}")
+
 
 
 
