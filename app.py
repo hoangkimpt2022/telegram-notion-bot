@@ -471,17 +471,35 @@ def find_matching_pages_counts(db_id: str, keyword: str) -> Tuple[int, int]:
     return unchecked, checked
 
 # ---------------- DAO helpers & create with relation ----------------
-def extract_number_from_prop(props: dict, candidate_names: List[str]) -> Optional[float]:
-    for name in candidate_names:
-        val = extract_prop_text(props, name)
-        if val:
-            v = val.replace(",", "").strip()
-            m = re.findall(r"-?\d+\.?\d*", v)
-            if m:
-                try:
-                    return float(m[0])
-                except ValueError:
-                    continue
+def extract_number_from_prop(props: dict, name: str) -> Optional[float]:
+    key = next((k for k in props if k.lower() == name.lower()), None)
+    if not key:
+        return None
+    prop = props[key]
+    ptype = prop.get("type")
+
+    # ĐỌC FORMULA (như cột "trước")
+    if ptype == "formula":
+        formula = prop.get("formula", {})
+        if formula.get("type") == "number":
+            num = formula.get("number")
+            return float(num) if num is not None else None
+        if formula.get("type") == "string":
+            text = formula.get("string", "")
+            m = re.search(r"-?\d+\.?\d*", text.replace(",", ""))
+            return float(m.group()) if m else None
+
+    # ĐỌC NUMBER
+    if ptype == "number":
+        num = prop.get("number")
+        return float(num) if num is not None else None
+
+    # ĐỌC TEXT (nếu cần)
+    if ptype in ("title", "rich_text"):
+        text = "".join(t.get("plain_text", "") for t in prop.get(ptype, []))
+        m = re.search(r"-?\d+\.?\d*", text.replace(",", ""))
+        return float(m.group()) if m else None
+
     return None
 
 def check_checkfield_has_check(props: dict, candidates: List[str]) -> bool:
@@ -495,17 +513,19 @@ def check_checkfield_has_check(props: dict, candidates: List[str]) -> bool:
             return True
     return False
 
-def build_dao_preview_text(name: str, display_total: Optional[float], per_day: Optional[float], days: int, start_date: datetime, calc_total: Optional[float]) -> str:
-    lines = []
-    lines.append(f"🔔 đáo lại cho: {name} - Tổng đáo: ✅ {int(display_total) if display_total is not None else display_total}")
-    lines.append(f"Lấy trước: {days} ngày {int(per_day) if per_day is not None else per_day} là {int(calc_total) if calc_total is not None else calc_total}")
-    lines.append("")
-    lines.append("Danh sách ngày dự kiến tạo (bắt đầu từ ngày mai):")
-    for i in range(days):
-        dt = start_date.date() + timedelta(days=i + 1)
+def build_dao_preview_text(name: str, display_total: float, per_day: float, days: int, calc_total: float) -> str:
+    lines = [
+        f"đáo lại cho: {name} - Tổng đáo: {int(display_total)}",
+        f"Lấy trước: {int(days)} ngày {int(per_day)} là {int(calc_total)}",
+        "",
+        "(bắt đầu từ ngày mai):"
+    ]
+    start = datetime.now().date() + timedelta(days=1)
+    for i in range(int(days)):
+        dt = start + timedelta(days=i)
         lines.append(f"{i+1}. {dt.isoformat()}")
     lines.append("")
-    lines.append(f"Gửi /ok để tạo {days} page, hoặc /cancel để hủy.")
+    lines.append(f"Gửi /ok {int(days)} ,  /cancel .")
     return "\n".join(lines)
 
 def notion_find_pages_by_name_and_date_in_db(db_id: str, name_token: str, date_iso: str) -> List[dict]:
@@ -784,16 +804,45 @@ def process_pending_selection(chat_id: str, text: str):
         send_telegram(chat_id, "⏳ Hết thời gian chọn. Yêu cầu đã bị hủy.")
         return
     typ = pc.get("type")
-    if typ in ("dao_choose", "dao_confirm"):
-        process_pending_selection_for_dao(chat_id, text)
+    elif pc["type"] == "dao_confirm":
+    if text.strip().lower() not in ("/ok", "ok"):
+        send_telegram(chat_id, "Gửi '/ok' để xác nhận.")
         return
-    matches = pc.get("matches", [])
-    total = len(matches)
-    sel_indices = parse_selection_text(text, total)
-    if not sel_indices:
-        send_telegram(chat_id, "Không nhận được lựa chọn hợp lệ. Yêu cầu đã bị hủy.")
+
+    # Lấy dữ liệu từ pending
+    source_page_id = pc["source_page_id"]
+    name = pc["source_preview"]
+    days = int(extract_number_from_prop(
+        notion_get_page(source_page_id).get("properties", {}), 
+        "# ngày trước"
+    ) or 0)
+
+    if days <= 0:
+        send_telegram(chat_id, "Số ngày không hợp lệ.")
         del pending_confirm[str(chat_id)]
         return
+
+    start_date = datetime.now().date() + timedelta(days=1)
+    dates = [start_date + timedelta(days=i) for i in range(days)]
+
+    # Tạo pages
+    created, skipped = create_pages_for_dates(name, source_page_id, dates)
+
+    # Gửi kết quả
+    lines = [f"Đã tạo {len(created)} page cho {name}:"]
+    for i, c in enumerate(created, 1):
+        try:
+            date_val = c["properties"][DATE_PROP_NAME]["date"]["start"]
+            lines.append(f"{i}. [{date_val}] {c['id']}")
+        except:
+            lines.append(f"{i}. [Lỗi ngày] {c['id']}")
+    if skipped:
+        lines.append(f"\nBỏ qua: {len(skipped)} (đã tồn tại hoặc lỗi)")
+    send_long_text(chat_id, "\n".join(lines))
+
+    # XÓA TRẠNG THÁI VÀ THOÁT
+    del pending_confirm[str(chat_id)]
+    return
     selected = [matches[i - 1] for i in sel_indices if i - 1 < len(matches)]
     if typ == "mark":
         succeeded, failed = [], []
@@ -996,9 +1045,26 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
         if not ok_check:
             send_telegram(chat_id, f"🔴 chưa thể đáo cho {preview}.")
             return
-        display_total = extract_number_from_prop(props, DAO_TOTAL_FIELD_CANDIDATES)
-        per_day = extract_number_from_prop(props, DAO_PERDAY_FIELD_CANDIDATES)
-        calc_total = extract_number_from_prop(props, DAO_CALC_TOTAL_FIELDS) 
+        # ĐỌC DỮ LIỆU TỪ CÁC CỘT CHÍNH XÁC
+display_total = extract_number_from_prop(props, "Đáo/thối")      # Cột tổng
+per_day       = extract_number_from_prop(props, "G ngày")        # Cột mỗi ngày
+days          = extract_number_from_prop(props, "# ngày trước")  # Cột số ngày
+calc_total    = extract_number_from_prop(props, "trước")         # CỘT FORMULA
+
+# Kiểm tra dữ liệu
+if display_total is None:
+    send_telegram(chat_id, f"Không tìm thấy cột 'Đáo/thối' cho {preview}")
+    return
+if per_day is None:
+    send_telegram(chat_id, f"Không tìm thấy cột 'G ngày' cho {preview}")
+    return
+if days is None or days <= 0:
+    preview_text = f"đáo lại cho: {preview} - Tổng đáo: {int(display_total)}\nKhông Lấy trước"
+    send_telegram(chat_id, preview_text)
+    return
+if calc_total is None:
+    send_telegram(chat_id, f"Không đọc được cột 'trước' (formula) cho {preview}")
+    return 
         if per_day is None or per_day == 0:
             send_telegram(chat_id, f"⚠️ Không tìm thấy hoặc per_day = 0. Kiểm tra cột phần/ngày trên page {preview}.")
             return
