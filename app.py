@@ -1216,6 +1216,7 @@ def webhook():
         try:
             chat_id = str(update['message']['chat']['id'])
             text = update['message'].get('text', '')
+            # Gọi đúng hàm xử lý
             threading.Thread(target=handle_incoming_message, args=(chat_id, text), daemon=True).start()
         except Exception as e:
             print("Webhook handling exception:", e)
