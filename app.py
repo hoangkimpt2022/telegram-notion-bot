@@ -620,6 +620,18 @@ def dao_preview_text_from_props(title: str, props: Dict[str, Any]) -> Tuple[bool
                f" /ok  hoặc cancel.")
         # return also computed metadata if caller needs
         return True, msg
+def send_progress(chat_id: int, step: int, total: int, label: str):
+    """
+    Gửi tiến trình (mỗi 10 bước, hoặc khi xong)
+    """
+    try:
+        if total == 0:
+            return
+        # chỉ gửi khi là bước đầu, mỗi 10 bước, hoặc bước cuối
+        if step == 1 or step % 10 == 0 or step == total:
+            send_telegram(chat_id, f"⏱️ {label}: {step}/{total} ...")
+    except Exception as e:
+        print("send_progress error:", e)
 
 def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[str, Any]):
     """
@@ -650,36 +662,56 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
             send_telegram(chat_id, f"⚠️ Không xác định được số ngày hợp lệ cho {title} (per_day={per_day}, pre_amount={pre_amount}, days_before={days_before})")
             return
 
-        # 1️⃣ XÓA TOÀN BỘ PAGE CŨ
-        all_pages = query_database_all(NOTION_DATABASE_ID, page_size=500)
-        matched = []
-        kw = title.strip().lower()
+        # --- CHUẨN HÓA: chỉ xóa page có parent.database_id == NOTION_DATABASE_ID ---
+        filtered_matched = []
         for p in all_pages:
-            props_p = p.get("properties", {})
-            name_p = extract_prop_text(props_p, "Name") or extract_prop_text(props_p, "Title") or ""
-            if kw in name_p.lower():
-                date_iso = None
-                date_key = find_prop_key(props_p, DATE_PROP_NAME)
-                if date_key and props_p.get(date_key, {}).get("date"):
-                    date_iso = props_p[date_key]["date"].get("start")
-                matched.append((p.get("id"), name_p, date_iso))
+    # lấy id/name/date giống logic matched trước đó
+        props_p = p.get("properties", {})
+        name_p = extract_prop_text(props_p, "Name") or extract_prop_text(props_p, "Title") or ""
+    if kw in name_p.lower():
+        # kiểm parent (nếu response có parent)
+        parent = p.get("parent") or {}
+        parent_db = parent.get("database_id") or p.get("parent_database_id") or None
+        # nếu parent_db không có (khi dùng query_database_all đúng DB, parent_db có thể None) -> vẫn chấp nhận
+        if parent_db and str(parent_db) != str(NOTION_DATABASE_ID):
+            # bỏ qua page không thuộc NOTION_DATABASE_ID
+            continue
+        date_iso = None
+        date_key = find_prop_key(props_p, DATE_PROP_NAME)
+        if date_key and props_p.get(date_key, {}).get("date"):
+            date_iso = props_p[date_key]["date"].get("start")
+        filtered_matched.append((p.get("id"), name_p, date_iso))
 
-        total_to_delete = len(matched)
-        send_telegram(chat_id, f"🧹 Đang xóa {total_to_delete} ngày của {title} (check + uncheck)...")
+        total_to_delete = len(filtered_matched)
+        send_telegram(chat_id, f"🧹 Đang xóa {total_to_delete} ngày của {title} (check + uncheck) trong DB {NOTION_DATABASE_ID}...")
         deleted = []
         failed_del = []
-        for idx, (pid, name_p, date_iso) in enumerate(matched, start=1):
-            send_progress(chat_id, idx, total_to_delete, f"🗑️ Đang xóa {title}")
-            try:
-                ok, msg = archive_page(pid)
-                if ok:
-                    deleted.append(pid)
-                else:
-                    failed_del.append((pid, msg))
-            except Exception as e:
-                failed_del.append((pid, str(e)))
-            time.sleep(PATCH_DELAY)
-        send_telegram(chat_id, f"✅ Đã xóa xong {len(deleted)}/{total_to_delete} mục của {title}.")
+
+for idx, (pid, name_p, date_iso) in enumerate(filtered_matched, start=1):
+    # báo tiến trình (hàm send_progress phải tồn tại ở đầu file)
+    try:
+        send_progress(chat_id, idx, total_to_delete, f"🗑️ Đang xóa {title}")
+    except Exception:
+        # fail-safe: nếu send_progress chưa được định nghĩa thì tiếp tục
+        pass
+
+    try:
+        ok, msg = archive_page(pid)
+        if ok:
+            deleted.append(pid)
+        else:
+            failed_del.append((pid, msg))
+    except Exception as e:
+        failed_del.append((pid, str(e)))
+    time.sleep(PATCH_DELAY)
+
+send_telegram(chat_id, f"✅ Đã xóa xong {len(deleted)}/{total_to_delete} mục của {title}.")
+if failed_del:
+    send_telegram(chat_id, f"⚠️ Có {len(failed_del)} mục xóa lỗi. Xem logs để debug.")
+    # in ra vài lỗi để debug (không quá dài)
+    for err in failed_del[:10]:
+        send_telegram(chat_id, f"- {err}")
+
 
         # 2️⃣ TẠO PAGE MỚI
         start = datetime.now().date() + timedelta(days=1)
