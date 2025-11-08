@@ -1162,54 +1162,6 @@ def process_pending_selection_for_dao(chat_id: str, text: str):
     send_telegram(chat_id, "Pending type không nhận diện (expecting dao flow or mark/archive).")
     del pending_confirm[str(chat_id)]
 
-# ---------------- Message handler ----------------
-def handle_incoming_message(chat_id: str, text: str):
-    try:
-        if TELEGRAM_CHAT_ID and str(chat_id) != str(TELEGRAM_CHAT_ID):
-            send_telegram(chat_id, "⚠️ Bot chưa được phép nhận lệnh từ chat này.")
-            return
-        raw = text.strip()
-        if not raw:
-            send_telegram(chat_id, "Vui lòng gửi lệnh hoặc từ khoá.")
-            return
-        low = raw.lower()
-        # Pending flow
-        if str(chat_id) in pending_confirm:
-            if low in ("/cancel", "cancel", "hủy", "huy"):
-                del pending_confirm[str(chat_id)]
-                send_telegram(chat_id, "Đã hủy thao tác đang chờ.")
-                return
-            if any(ch.isdigit() for ch in low) or low in ("all", "tất cả", "tat ca", "none") or low in ("ok", "yes", "đồng ý", "dong y"):
-                send_telegram(chat_id, "Đang xử lý lựa chọn...")
-                threading.Thread(target=process_pending_selection, args=(chat_id, raw), daemon=True).start()
-                return
-            del pending_confirm[str(chat_id)]
-        if low in ("/cancel", "cancel", "hủy", "huy"):
-            send_telegram(chat_id, "Không có thao tác đang chờ. /cancel ignored.")
-            return
-        keyword, count, action = parse_user_command(raw)
-        if action == "undo":
-            send_telegram(chat_id, "Đang tìm và undo...")
-            threading.Thread(target=undo_last, args=(chat_id, None, keyword if keyword else None), daemon=True).start()
-            return
-        if action == "archive":
-            send_telegram(chat_id, "Đang xử lý archive...")
-            threading.Thread(target=handle_command_archive, args=(chat_id, keyword, count, raw), daemon=True).start()
-            return
-        if action == "dao":
-            send_telegram(chat_id, "Đang xử lý đáo...")
-            threading.Thread(target=handle_command_dao, args=(chat_id, keyword, raw), daemon=True).start()
-            return
-        send_telegram(chat_id, "Đang xử lý...")
-        threading.Thread(target=handle_command_mark, args=(chat_id, keyword, count, raw), daemon=True).start()
-    except Exception as e:
-        print("handle_incoming_message exception:", e)
-        traceback.print_exc()
-        try:
-            send_telegram(chat_id, f"❌ Lỗi xử lý: {str(e)}")
-        except:
-            pass
-
 # ---------------- Webhook / health ----------------
 @app.route('/webhook', methods=['POST'])
 def webhook():
