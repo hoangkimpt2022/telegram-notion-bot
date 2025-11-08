@@ -662,38 +662,38 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
             send_telegram(chat_id, f"⚠️ Không xác định được số ngày hợp lệ cho {title} (per_day={per_day}, pre_amount={pre_amount}, days_before={days_before})")
             return
 
-        # --- CHUẨN HÓA: chỉ xóa page có parent.database_id == NOTION_DATABASE_ID ---
-        filtered_matched = []
-        for p in all_pages:
+    # --- CHUẨN HÓA: chỉ xóa page có parent.database_id == NOTION_DATABASE_ID ---
+filtered_matched = []
+
+for p in all_pages:
     # lấy id/name/date giống logic matched trước đó
-        props_p = p.get("properties", {})
-        name_p = extract_prop_text(props_p, "Name") or extract_prop_text(props_p, "Title") or ""
-    if kw in name_p.lower():
-        # kiểm parent (nếu response có parent)
-        parent = p.get("parent") or {}
-        parent_db = parent.get("database_id") or p.get("parent_database_id") or None
-        # nếu parent_db không có (khi dùng query_database_all đúng DB, parent_db có thể None) -> vẫn chấp nhận
-        if parent_db and str(parent_db) != str(NOTION_DATABASE_ID):
-            # bỏ qua page không thuộc NOTION_DATABASE_ID
-            continue
-        date_iso = None
-        date_key = find_prop_key(props_p, DATE_PROP_NAME)
-        if date_key and props_p.get(date_key, {}).get("date"):
-            date_iso = props_p[date_key]["date"].get("start")
-        filtered_matched.append((p.get("id"), name_p, date_iso))
+    props_p = p.get("properties", {})
+    name_p = extract_prop_text(props_p, "Name") or extract_prop_text(props_p, "Title") or ""
+    if kw not in name_p.lower():
+        continue
 
-        total_to_delete = len(filtered_matched)
-        send_telegram(chat_id, f"🧹 Đang xóa {total_to_delete} ngày của {title} (check + uncheck) trong DB {NOTION_DATABASE_ID}...")
-        deleted = []
-        failed_del = []
+    # kiểm tra parent (chỉ giữ page thuộc NOTION_DATABASE_ID)
+    parent = p.get("parent", {})
+    parent_db = parent.get("database_id")
+    if parent_db and str(parent_db) != str(NOTION_DATABASE_ID):
+        continue
 
+    # lấy ngày (nếu có)
+    date_iso = None
+    date_key = find_prop_key(props_p, DATE_PROP_NAME)
+    if date_key and props_p.get(date_key, {}).get("date"):
+        date_iso = props_p[date_key]["date"].get("start")
+
+    filtered_matched.append((p.get("id"), name_p, date_iso))
+
+total_to_delete = len(filtered_matched)
+send_telegram(chat_id, f"🧹 Đang xóa {total_to_delete} ngày của {title} (check + uncheck) trong DB chính...")
+
+deleted, failed_del = [], []
+
+# bắt đầu vòng lặp xoá từng page
 for idx, (pid, name_p, date_iso) in enumerate(filtered_matched, start=1):
-    # báo tiến trình (hàm send_progress phải tồn tại ở đầu file)
-    try:
-        send_progress(chat_id, idx, total_to_delete, f"🗑️ Đang xóa {title}")
-    except Exception:
-        # fail-safe: nếu send_progress chưa được định nghĩa thì tiếp tục
-        pass
+    send_progress(chat_id, idx, total_to_delete, f"🗑️ Đang xóa {title}")
 
     try:
         ok, msg = archive_page(pid)
@@ -703,14 +703,16 @@ for idx, (pid, name_p, date_iso) in enumerate(filtered_matched, start=1):
             failed_del.append((pid, msg))
     except Exception as e:
         failed_del.append((pid, str(e)))
+
     time.sleep(PATCH_DELAY)
 
-send_telegram(chat_id, f"✅ Đã xóa xong {len(deleted)}/{total_to_delete} mục của {title}.")
+send_telegram(chat_id, f"✅ Đã xóa xong {len(deleted)}/{total_to_delete} mục của {title} trong {NOTION_DATABASE_ID}.")
+
 if failed_del:
     send_telegram(chat_id, f"⚠️ Có {len(failed_del)} mục xóa lỗi. Xem logs để debug.")
-    # in ra vài lỗi để debug (không quá dài)
-    for err in failed_del[:10]:
-        send_telegram(chat_id, f"- {err}")
+    for err_pid, err_msg in failed_del[:10]:
+        send_telegram(chat_id, f"- {err_pid}: {err_msg}")
+   
 
 
         # 2️⃣ TẠO PAGE MỚI
