@@ -1046,55 +1046,44 @@ def handle_command_dao(chat_id: str, keyword: str, orig_cmd: str):
             send_telegram(chat_id, f"🔴 chưa thể đáo cho {preview}.")
             return
         # ĐỌC DỮ LIỆU TỪ CÁC CỘT CHÍNH XÁC
-display_total = extract_number_from_prop(props, "Đáo/thối")      # Cột tổng
-per_day       = extract_number_from_prop(props, "G ngày")        # Cột mỗi ngày
-days          = extract_number_from_prop(props, "# ngày trước")  # Cột số ngày
-calc_total    = extract_number_from_prop(props, "trước")         # CỘT FORMULA
+def handle_command_dao(chat_id: str, keyword: str, raw: str):
+    # ... (phần tìm page, lấy props, preview, v.v.)
 
-# Kiểm tra dữ liệu
-if display_total is None:
-    send_telegram(chat_id, f"Không tìm thấy cột 'Đáo/thối' cho {preview}")
-    return
-if per_day is None:
-    send_telegram(chat_id, f"Không tìm thấy cột 'G ngày' cho {preview}")
-    return
-if days is None or days <= 0:
-    preview_text = f"đáo lại cho: {preview} - Tổng đáo: {int(display_total)}\nKhông Lấy trước"
-    send_telegram(chat_id, preview_text)
-    return
-if calc_total is None:
-    send_telegram(chat_id, f"Không đọc được cột 'trước' (formula) cho {preview}")
-    return 
-        if per_day is None or per_day == 0:
-            send_telegram(chat_id, f"⚠️ Không tìm thấy hoặc per_day = 0. Kiểm tra cột phần/ngày trên page {preview}.")
-            return
-        if calc_total is None:
-            preview_text = f"🔔 đáo lại cho: {preview} - Tổng đáo: ✅ {int(display_total) if display_total else 'N/A'}\nKhông Lấy trước"
-            send_telegram(chat_id, preview_text)
-            return
-        days = int(math.ceil(calc_total / per_day))
-        if days <= 0:
-            send_telegram(chat_id, f"⚠️ Kết quả days không hợp lệ: {days}.")
-            return
-        if days > DAO_MAX_DAYS:
-            send_telegram(chat_id, f"⚠️ Số ngày ({days}) vượt mức tối đa ({DAO_MAX_DAYS}). Hãy giảm hoặc thay đổi per_day.")
-            return
-        start_date = datetime.now().date() + timedelta(days=1)
-        preview_text = build_dao_preview_text(preview, display_total, per_day, days, start_date, calc_total)
-        pending_confirm[str(chat_id)] = {
-            "type": "dao_confirm",
-            "keyword": keyword,
-            "source_page_id": pid,
-            "source_preview": preview,
-            "display_total": display_total,
-            "per_day": per_day,
-            "calc_total": calc_total,
-            "days": days,
-            "start_date": start_date.isoformat(),
-            "expires": time.time() + DAO_CONFIRM_TIMEOUT,
-            "orig_command": orig_cmd
-        }
-        send_long_text(chat_id, preview_text)
+    props = notion_get_page(pid).get("properties", {})
+
+    # ===> DÁN ĐOẠN NÀY VÀO ĐÂY <===
+    display_total = extract_number_from_prop(props, "Đáo/thối")
+    per_day       = extract_number_from_prop(props, "G ngày")
+    days          = extract_number_from_prop(props, "# ngày trước")
+    calc_total    = extract_number_from_prop(props, "trước")
+
+    if display_total is None:
+        send_telegram(chat_id, f"Không tìm thấy cột 'Đáo/thối' cho {preview}")
+        return
+    if per_day is None:
+        send_telegram(chat_id, f"Không tìm thấy cột 'G ngày' cho {preview}")
+        return
+    if days is None or days <= 0:
+        preview_text = f"đáo lại cho: {preview} - Tổng đáo: {int(display_total)}\nKhông Lấy trước"
+        send_telegram(chat_id, preview_text)
+        return
+    if calc_total is None:
+        send_telegram(chat_id, f"Không đọc được cột 'trước' (formula) cho {preview}")
+        return
+    # ===> HẾT ĐOẠN DÁN <===
+
+    # Tiếp tục tạo preview, lưu pending, v.v.
+    start_date = datetime.now().date() + timedelta(days=1)
+    dates = [start_date + timedelta(days=i) for i in range(int(days))]
+    preview_text = build_dao_preview_text(preview, display_total, per_day, int(days), calc_total)
+    pending_confirm[str(chat_id)] = {
+        "type": "dao_confirm",
+        "source_page_id": pid,
+        "source_preview": preview,
+        "dates": [d.isoformat() for d in dates],
+        "expires": time.time() + 120,
+    }
+    send_long_text(chat_id, preview_text)
     except Exception as e:
         print("handle_command_dao exception:", e)
         traceback.print_exc()
