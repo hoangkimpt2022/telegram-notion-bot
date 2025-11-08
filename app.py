@@ -33,6 +33,7 @@ app = Flask(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # optional: restrict to one chat id
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+LA_NOTION_DATABASE_ID = os.getenv("LA_NOTION_DATABASE_ID")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")  # calendar DB (where individual dates live)
 TARGET_NOTION_DATABASE_ID = os.getenv("TARGET_NOTION_DATABASE_ID")  # dao DB (master entries)
 CHECKBOX_PROP = os.getenv("CHECKBOX_PROP", "Đã Góp")  # checkbox property in calendar DB
@@ -399,7 +400,7 @@ def count_checked_unchecked(keyword: str) -> Tuple[int, int]:
 
 def build_preview_text_for_matches(keyword: str, matches: List[Tuple[str, str, Optional[str]]]) -> str:
     checked, unchecked = count_checked_unchecked(keyword)
-    header = f"🔎 : '{keyword}'\n\n✅ Đã tích: {checked}\n\n🟡 Chưa tích: {unchecked}\n\n"
+    header = f"🔎 : '{keyword}'\n✅ Đã tích: {checked}\n🟡 Chưa tích: {unchecked}\n"
     header += f"📤 Gửi số ( ví dụ 1 hoặc 1-3 ) trong {WAIT_CONFIRM}s để chọn, hoặc /cancel.\n\n"
     lines = []
     for i, (pid, title, date_iso) in enumerate(matches, start=1):
@@ -622,78 +623,153 @@ def dao_preview_text_from_props(title: str, props: Dict[str, Any]) -> Tuple[bool
 
 def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[str, Any]):
     """
-    Tạo các page mới trong NOTION_DATABASE_ID dựa trên dữ liệu DAO (TARGET_NOTION_DATABASE_ID)
+    Xử lý đáo:
+     - archive (xóa) toàn bộ page của 'key' trong NOTION_DATABASE_ID (checked + unchecked)
+     - tạo `take_days` page mới bắt đầu từ ngày mai, mỗi page có Đã Góp = True (theo yêu cầu)
+     - tạo 1 page Lãi trong LA_NOTION_DATABASE_ID (nếu LA_NOTION_DATABASE_ID set và có giá trị Lãi)
+     - báo progress chi tiết về Telegram
     """
-    title = extract_prop_text(props, "Name") or "UNKNOWN"
-    total_text = extract_prop_text(props, "Đáo/thối")
-    total_val = parse_money_from_text(total_text) or 0
-    per_day = parse_money_from_text(extract_prop_text(props, "G ngày")) or 0
-    days_before = parse_money_from_text(extract_prop_text(props, "ngày trước")) or 0
-    pre_amount = parse_money_from_text(extract_prop_text(props, "trước")) or 0
-
-    # nếu 'trước' = 0 -> không tạo
-    if pre_amount == 0:
-        send_telegram(chat_id, f"🔔 đáo lại cho: {title} - Tổng đáo: ✅ {int(total_val)}\n\nKhông Lấy trước")
-        return
-
-    # tính số ngày cần tạo
-    take_days = int(days_before) if days_before > 0 else int(math.ceil(pre_amount / per_day)) if per_day else 0
-    if take_days <= 0:
-        send_telegram(chat_id, f"⚠️ Không xác định được số ngày hợp lệ cho {title}")
-        return
-
-    start = datetime.now().date() + timedelta(days=1)
-    created = []
-    failed = []
-
-    for i in range(take_days):
-        d = start + timedelta(days=i)
-        # tạo properties chuẩn khớp DB của bạn
-        props_payload = {
-            "Name": {"title": [{"type": "text", "text": {"content": f"{title} - {d.isoformat()}"}}]},
-            "Ngày Góp": {"date": {"start": d.isoformat()}},
-            "Tiền": {"number": per_day},   # ✅ sao chép giá trị từ G ngày
-            "Đã Góp": {"checkbox": False},
-            "Lịch G": {"relation": [{"id": source_page_id}]},  # ✅ link về DAO page gốc
-        }
-        try:
-            url = "https://api.notion.com/v1/pages"
-            body = {
-                "parent": {"database_id": NOTION_DATABASE_ID},
-                "properties": props_payload
-            }
-            r = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=20)
-            if r.status_code in (200, 201):
-                created.append(r.json())
-            else:
-                failed.append(f"{r.status_code}: {r.text}")
-            time.sleep(PATCH_DELAY)
-        except Exception as e:
-            failed.append(str(e))
-
-    # ✅ tick lại checkbox đáo/thối (nếu có)
     try:
-        page = get_page(source_page_id)
-        page_props = page.get("properties", {})
-        k = find_prop_key(page_props, "Đáo/thối")
-        if k:
-            patch_page_properties(source_page_id, {k: {"checkbox": True}})
-    except Exception as e:
-        print("Error updating DAO checkbox:", e)
+        title = extract_prop_text(props, "Name") or "UNKNOWN"
+        total_text = extract_prop_text(props, "Đáo/thối")
+        total_val = parse_money_from_text(total_text) or 0
 
-    # 📨 gửi kết quả
-    lines = [f"✅ Đã tạo {len(created)} page mới cho {title}:"]
-    for i, c in enumerate(created, start=1):
-        try:
-            date_val = c["properties"]["Ngày Góp"]["date"]["start"]
-            lines.append(f"{i}. [{date_val}] {c.get('id')}")
-        except:
-            lines.append(f"{i}. [Lỗi ngày] {c.get('id')}")
-    if failed:
-        lines.append(f"\n⚠️ Lỗi khi tạo: {len(failed)}")
-        for f in failed:
-            lines.append(f"- {f}")
-    send_long_text(chat_id, "\n".join(lines))
+        # đọc các trường cần thiết
+        per_day = parse_money_from_text(extract_prop_text(props, "G ngày")) or 0
+        days_before = parse_money_from_text(extract_prop_text(props, "ngày trước")) or 0
+        pre_amount = parse_money_from_text(extract_prop_text(props, "trước")) or 0
+
+        # tính số ngày cần tạo (take_days)
+        if pre_amount == 0:
+            send_telegram(chat_id, f"🔔 đáo lại cho: {title} - Tổng đáo: ✅ {int(total_val) if total_val else 'N/A'}\n\nKhông Lấy trước")
+            return
+
+        take_days = int(days_before) if days_before and int(days_before) > 0 else (int(math.ceil(pre_amount / per_day)) if per_day else 0)
+        if take_days <= 0:
+            send_telegram(chat_id, f"⚠️ Không xác định được số ngày hợp lệ cho {title} (per_day={per_day}, pre_amount={pre_amount}, days_before={days_before})")
+            return
+
+        # 1) TÌNH TRẠNG: XÓA TOÀN BỘ PAGE CÓ TÊN title TRONG NOTION_DATABASE_ID
+        # tìm tất cả page matching title (cả checked + unchecked)
+        all_pages = query_database_all(NOTION_DATABASE_ID, page_size=500)
+        matched = []
+        kw = title.strip().lower()
+        for p in all_pages:
+            props_p = p.get("properties", {})
+            name_p = extract_prop_text(props_p, "Name") or extract_prop_text(props_p, "Title") or ""
+            if kw in name_p.lower():
+                date_iso = None
+                date_key = find_prop_key(props_p, DATE_PROP_NAME)
+                if date_key and props_p.get(date_key, {}).get("date"):
+                    date_iso = props_p[date_key]["date"].get("start")
+                matched.append((p.get("id"), name_p, date_iso))
+
+        total_to_delete = len(matched)
+        send_telegram(chat_id, f"🧹 Đang xóa {total_to_delete} ngày của {title} (check + uncheck)...")
+        # xóa từng page, báo tiến trình
+        deleted = []
+        failed_del = []
+        for idx, (pid, name_p, date_iso) in enumerate(matched, start=1):
+            send_progress(chat_id, idx, total_to_delete, f"🗑️ Đang xóa {title}")
+            try:
+                ok, msg = archive_page(pid)
+                if ok:
+                    deleted.append(pid)
+                else:
+                    failed_del.append((pid, msg))
+            except Exception as e:
+                failed_del.append((pid, str(e)))
+            time.sleep(PATCH_DELAY)
+        send_telegram(chat_id, f"✅ Đã xóa xong {len(deleted)}/{total_to_delete} mục của {title}.")
+
+        # 2) TẠO PAGE MỚI: tạo take_days page, bắt đầu từ ngày mai
+        start = datetime.now().date() + timedelta(days=1)
+        created = []
+        failed_create = []
+        send_telegram(chat_id, f"🛠️ Đang tạo {take_days} ngày mới cho {title} bắt đầu từ ngày mai...")
+        for count in range(1, take_days + 1):
+            d = start + timedelta(days=(count - 1))
+            props_payload = {
+                "Name": {"title": [{"type": "text", "text": {"content": f"{title} - {d.isoformat()}"}}]},
+                DATE_PROP_NAME: {"date": {"start": d.isoformat()}},
+                # "Tiền" property: ghi per_day nếu cột tồn tại (số)
+                "Tiền": {"number": per_day} if per_day else {},
+                # Theo yêu cầu: tạo page mới phải check vào mục 'Đã Góp'
+                CHECKBOX_PROP: {"checkbox": True},
+                # relation link về source page (Lịch G)
+                "Lịch G": {"relation": [{"id": source_page_id}]},
+            }
+            # lọc bỏ field rỗng (Notion không thích property rỗng)
+            clean_props = {k: v for k, v in props_payload.items() if v and not (isinstance(v, dict) and v == {})}
+            try:
+                url = "https://api.notion.com/v1/pages"
+                body = {"parent": {"database_id": NOTION_DATABASE_ID}, "properties": clean_props}
+                r = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=20)
+                if r.status_code in (200, 201):
+                    created.append(r.json())
+                else:
+                    failed_create.append(f"{r.status_code}: {r.text}")
+                send_progress(chat_id, count, take_days, f"📅 Đang tạo ngày mới cho {title}")
+            except Exception as e:
+                failed_create.append(str(e))
+            time.sleep(PATCH_DELAY)
+
+        send_telegram(chat_id, f"✅ Đã tạo {len(created)} page mới cho {title}.")
+        # gửi list tóm tắt (không hiện id dài)
+        summary_lines = [f"✅ Đã tạo {len(created)} ngày mới cho {title} (ghi chú: page mới đã check 'Đã Góp'):"]
+        for i, c in enumerate(created, start=1):
+            try:
+                date_val = c["properties"][DATE_PROP_NAME]["date"]["start"]
+                summary_lines.append(f"{i}. [{date_val}] {title}")
+            except:
+                summary_lines.append(f"{i}. {title} - (id:{c.get('id')})")
+        send_long_text(chat_id, "\n".join(summary_lines))
+
+        # 3) TẠO PAGE LÃI (nếu LA_NOTION_DATABASE_ID set)
+        # đọc giá trị Lãi từ props (cột "Lai" hoặc "Lãi")
+        lai_text = extract_prop_text(props, "Lai") or extract_prop_text(props, "Lãi") or ""
+        lai_amt = parse_money_from_text(lai_text) or 0
+        if LA_NOTION_DATABASE_ID and lai_amt > 0:
+            send_telegram(chat_id, f"💸 Tiếp tục tiến trình tạo Lãi cho {title}...")
+            # relation_id: ưu tiên relation về first created page nếu có, else source_page_id
+            relation_target_id = created[0].get("id", source_page_id) if created else source_page_id
+            create_lai_page(chat_id, title, lai_amt, relation_target_id)
+        else:
+            send_telegram(chat_id, f"ℹ️ Không có giá trị Lãi hoặc LA_NOTION_DATABASE_ID chưa cài đặt. Bỏ qua tạo Lãi cho {title}.")
+
+        return
+    except Exception as e:
+        send_telegram(chat_id, f"❌ Lỗi tiến trình đáo cho {title}: {str(e)}")
+        traceback.print_exc()
+        return
+
+
+def create_lai_page(chat_id: int, title: str, lai_amount: float, relation_id: str):
+    """
+    Tạo 1 page trong LA_NOTION_DATABASE_ID với:
+     - Name = title
+     - Lãi = lai_amount
+     - Ngày Lãi = hôm nay
+     - Lịch G = relation tới NOTION_DATABASE_ID
+    """
+    try:
+        today = datetime.now().date().isoformat()
+        props_payload = {
+            "Name": {"title": [{"type": "text", "text": {"content": title}}]},
+            "Lãi": {"number": lai_amount},
+            "Ngày Lãi": {"date": {"start": today}},
+            "Lịch G": {"relation": [{"id": relation_id}]}
+        }
+        url = "https://api.notion.com/v1/pages"
+        body = {"parent": {"database_id": LA_NOTION_DATABASE_ID}, "properties": props_payload}
+        r = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=15)
+        if r.status_code in (200, 201):
+            send_telegram(chat_id, f"💰 Đã tạo Lãi cho {title} ({lai_amount})")
+        else:
+            send_telegram(chat_id, f"⚠️ Tạo Lãi lỗi: {r.status_code} - {r.text}")
+    except Exception as e:
+        send_telegram(chat_id, f"❌ Lỗi tạo Lãi cho {title}: {str(e)}")
+
 
 
 # ---------------- Dispatcher & webhook ----------------
@@ -718,10 +794,10 @@ def handle_text_message(chat_id: int, text: str):
     # archive command endswith ' xóa' or ' xoa'
     if low.endswith(" xóa") or low.endswith(" xoa"):
         kw = txt[:-4].strip()
-        matches = find_calendar_matches(kw)
+        matches = find_matching_all_pages_in_db(NOTION_DATABASE_ID, keyword, limit=500)
         checked, unchecked = count_checked_unchecked(kw)
-        header = f"🔎 Khách hàng: '{kw}'\n\n✅ Đã tích: {checked}\n\n🟡 Chưa tích: {unchecked}\n\n"
-        header += f"⚠️ CHÚ Ý: Bạn sắp archive {len(matches)} mục chứa '{kw}'.\n\nGửi số (ví dụ 1-7) trong {WAIT_CONFIRM}s để chọn, hoặc 'all' để archive tất cả, hoặc /cancel.\n\n"
+        header = f"🔎 Khách hàng: '{kw}'\n✅ Đã tích: {checked}\n🟡 Chưa tích: {unchecked}\n"
+        header += f"⚠️ CHÚ Ý: Bạn sắp archive {len(matches)} mục chứa '{kw}'.\n\nGửi số (ví dụ 1-7) trong {WAIT_CONFIRM}s để chọn, hoặc /all để archive tất cả, hoặc /cancel.\n\n"
         lines = []
         for i,(pid,title,date_iso) in enumerate(matches, start=1):
             lines.append(f"{i}. [{date_iso[:10] if date_iso else '-'}] {title}")
@@ -739,6 +815,7 @@ def handle_text_message(chat_id: int, text: str):
             # list options to pick
             header = f"Tìm thấy {len(matches)} kết quả cho '{kw}'. Chọn index để tiếp tục hoặc gửi SĐT để match chính xác."
             lines = []
+            send_telegram(chat_id, f"🛠️ Đang tạo {take_days} ngày mới cho {title} bắt đầu từ ngày mai...")
             for i,(pid,title,props) in enumerate(matches, start=1):
                 # show some columns: Đáo/thối, G ngày, # ngày trước, trước
                 dt = extract_prop_text(props, "Đáo/thối")
@@ -746,6 +823,7 @@ def handle_text_message(chat_id: int, text: str):
                 nb = extract_prop_text(props, "# ngày trước")
                 prev = extract_prop_text(props, "trước")
                 lines.append(f"{i}. {title} - Đáo/thối: {dt} - G ngày: {gday} - # ngày trước: {nb} - trước: {prev}")
+                send_telegram(chat_id, f"✅ Đã tạo xong {len(created)} ngày mới cho {title}.")
             send_long_text(chat_id, header + "\n" + "\n".join(lines))
             pending[str(chat_id)] = {"type":"dao_select","keyword":kw,"matches":matches,"expires":time.time()+WAIT_CONFIRM}
             return
@@ -774,6 +852,95 @@ def handle_text_message(chat_id: int, text: str):
     send_long_text(chat_id, msg)
     pending[str(chat_id)] = {"type":"mark_select","keyword":kw,"matches":matches,"expires":time.time()+WAIT_CONFIRM}
     return
+    def handle_incoming_message(chat_id: str, text: str):
+    """
+    Xử lý lệnh từ Telegram và báo tiến trình từng bước.
+    """
+    try:
+        send_telegram(chat_id, f"📩 Nhận lệnh: {text.strip()}")
+        if TELEGRAM_CHAT_ID and str(chat_id) != str(TELEGRAM_CHAT_ID):
+            send_telegram(chat_id, "⛔ Bot chưa được phép nhận lệnh từ chat này.")
+            return
+
+        raw = text.strip()
+        if not raw:
+            send_telegram(chat_id, "⚠️ Vui lòng gửi lệnh hoặc từ khoá.")
+            return
+
+        low = raw.lower()
+
+        # --- Kiểm tra nếu đang có thao tác chờ xác nhận ---
+        if str(chat_id) in pending_confirm:
+            send_telegram(chat_id, "⏳ Có thao tác đang chờ xác nhận...")
+            pc = pending_confirm[str(chat_id)]
+
+            # user muốn hủy
+            if low in ("/cancel", "cancel", "hủy", "huy"):
+                del pending_confirm[str(chat_id)]
+                send_telegram(chat_id, "❎ Đã hủy thao tác đang chờ.")
+                return
+
+            # user chọn số, all, ok, yes...
+            if any(ch.isdigit() for ch in low) or low in ("all", "tất cả", "tat ca", "ok", "yes", "đồng ý", "dong y"):
+                send_telegram(chat_id, f"🚀 Đang xử lý lựa chọn ({pc.get('type', 'unknown')})...")
+                if pc.get("type") in ("dao_choose", "dao_confirm"):
+                    threading.Thread(
+                        target=process_pending_selection_for_dao,
+                        args=(chat_id, raw),
+                        daemon=True,
+                    ).start()
+                else:
+                    threading.Thread(
+                        target=process_pending_selection,
+                        args=(chat_id, raw),
+                        daemon=True,
+                    ).start()
+                return
+
+            # user nhập không hợp lệ
+            send_telegram(chat_id, "⚠️ Không hiểu lựa chọn, thao tác chờ bị hủy.")
+            del pending_confirm[str(chat_id)]
+            return
+
+        # --- Nếu người dùng gửi /cancel mà không có pending ---
+        if low in ("/cancel", "cancel", "hủy", "huy"):
+            send_telegram(chat_id, "Không có thao tác đang chờ. /cancel bị bỏ qua.")
+            return
+
+        # --- Phân tích lệnh người dùng ---
+        keyword, count, action = parse_user_command(raw)
+        send_telegram(chat_id, f"🧠 Phân tích lệnh: action={action}, keyword={keyword}, count={count}")
+
+        # --- Undo ---
+        if action == "undo":
+            send_telegram(chat_id, "♻️ Đang tìm và hoàn tác thao tác gần nhất...")
+            threading.Thread(target=undo_last, args=(chat_id, None, keyword if keyword else None), daemon=True).start()
+            return
+
+        # --- Xóa (archive) ---
+        if action == "archive":
+            send_telegram(chat_id, "🗑️ Đang chuẩn bị danh sách cần xóa...")
+            threading.Thread(target=handle_command_archive, args=(chat_id, keyword, count, raw), daemon=True).start()
+            return
+
+        # --- Đáo (tạo mới) ---
+        if action == "dao":
+            send_telegram(chat_id, f"💰 Bắt đầu xử lý đáo cho: {keyword}")
+            threading.Thread(target=handle_command_dao, args=(chat_id, keyword, raw), daemon=True).start()
+            return
+
+        # --- Đánh dấu (mark) ---
+        send_telegram(chat_id, f"🔍 Đang tìm dữ liệu '{keyword}' trong Notion...")
+        threading.Thread(target=handle_command_mark, args=(chat_id, keyword, count, raw), daemon=True).start()
+
+    except Exception as e:
+        print("❌ handle_incoming_message exception:", e)
+        traceback.print_exc()
+        try:
+            send_telegram(chat_id, f"⚠️ Lỗi xử lý lệnh: {str(e)}")
+        except:
+            pass
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
