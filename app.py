@@ -352,33 +352,29 @@ def parse_money_from_text(s: str) -> Optional[float]:
 
 def find_calendar_matches(keyword: str, include_archived=False) -> List[Tuple[str, str, Optional[str]]]:
     """
-    Return list of (page_id, title_preview, date_iso) from NOTION_DATABASE_ID
-    Filter by title containing keyword (case-insensitive)
+    Trả về danh sách chỉ các page CHƯA TÍCH (Đã Góp == False)
     """
-    results = query_database_all(NOTION_DATABASE_ID, page_size=100)
+    results = query_database_all(NOTION_DATABASE_ID, page_size=200)
     matches = []
     kw = keyword.strip().lower()
     for p in results:
         props = p.get("properties", {})
         title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
-        if kw in title.lower():
-            # exclude archived? Notion query_all returns pages whether archived or not; but page has "archived" at top-level sometimes
-            date = None
+        if kw not in title.lower():
+            continue
+        # Kiểm tra checkbox
+        key = find_prop_key(props, CHECKBOX_PROP)
+        is_checked = False
+        if key and props[key].get("type") == "checkbox":
+            is_checked = props[key].get("checkbox", False)
+        if not is_checked:
             date_key = find_prop_key(props, DATE_PROP_NAME)
+            date_iso = None
             if date_key and props.get(date_key, {}).get("date"):
-                date = props.get(date_key, {}).get("date", {}).get("start")
-            matches.append((p.get("id"), title, date))
-            if len(matches) >= MAX_PREVIEW:
-                break
-    # sort by date ascending if available
-    def date_sort_key(item):
-        try:
-            if item[2]:
-                return item[2]
-            return ""
-        except:
-            return ""
-    matches.sort(key=date_sort_key)
+                date_iso = props.get(date_key)["date"].get("start")
+            matches.append((p.get("id"), title, date_iso))
+    # sắp xếp theo ngày
+    matches.sort(key=lambda x: x[2] or "")
     return matches
 
 def count_checked_unchecked(keyword: str) -> Tuple[int, int]:
@@ -440,9 +436,12 @@ def mark_pages_by_indices(chat_id: int, keyword: str, matches: List[Tuple[str,st
         lines = [f"✅ Đã đánh dấu {len(succeeded)} mục:\n"]
         for i,(p,t,d) in enumerate(succeeded, start=1):
             lines.append(f"{i}. [{d[:10] if d else '-'}] {t}")
+        # sau khi đánh dấu xong, cập nhật lại số đếm
         checked, unchecked = count_checked_unchecked(keyword)
-        lines.append(f"\n✅ Đã tích: {checked}\n\n🟡 Chưa tích: {unchecked}")
+        lines.append(f"\n✅ Đã tích: {checked}")
+        lines.append(f"\n🟡 Chưa tích: {unchecked}")
         send_long_text(chat_id, "\n".join(lines))
+
     else:
         send_telegram(chat_id, "Không có mục nào được đánh dấu.")
 
@@ -614,72 +613,88 @@ def dao_preview_text_from_props(title: str, props: Dict[str, Any]) -> Tuple[bool
         start = datetime.now().date() + timedelta(days=1)
         dates = [start + timedelta(days=i) for i in range(take_days)]
         date_list_text = "\n".join([d.isoformat() for d in dates])
-        msg = (f"🔔 đáo lại cho: {title} - Tổng đáo: ✅ {int(total_val) if total_val else 'N/A'}\n\n"
+        msg = (f"🔔 đáo lại cho: {title} - Tổng đáo: CK ✅ {int(total_val) if total_val else 'N/A'}\n"
                f"Lấy trước: {take_days} ngày {int(per_day) if per_day else 0} là {taken_sum}\n\n"
-               f"Danh sách ngày dự kiến tạo (bắt đầu từ ngày mai):\n{date_list_text}\n\n"
-               f"Gửi /ok để tạo {take_days} page {NOTION_DATABASE_ID}, hoặc cancel để hủy.")
+               f"(bắt đầu từ ngày mai):\n{date_list_text}\n\n"
+               f" /ok  hoặc cancel.")
         # return also computed metadata if caller needs
         return True, msg
 
 def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[str, Any]):
     """
-    Create pages in NOTION_DATABASE_ID based on 'trước' and 'G ngày' and '# ngày trước'.
+    Tạo các page mới trong NOTION_DATABASE_ID dựa trên dữ liệu DAO (TARGET_NOTION_DATABASE_ID)
     """
-    # re-run compute like above
     title = extract_prop_text(props, "Name") or "UNKNOWN"
     total_text = extract_prop_text(props, "Đáo/thối")
     total_val = parse_money_from_text(total_text) or 0
     per_day = parse_money_from_text(extract_prop_text(props, "G ngày")) or 0
-    days_before = parse_money_from_text(extract_prop_text(props, "# ngày trước")) or 0
+    days_before = parse_money_from_text(extract_prop_text(props, "ngày trước")) or 0
     pre_amount = parse_money_from_text(extract_prop_text(props, "trước")) or 0
+
+    # nếu 'trước' = 0 -> không tạo
     if pre_amount == 0:
-        send_telegram(chat_id, f"🔔 đáo lại cho: {title} - Tổng đáo: ✅ {int(total_val) if total_val else 'N/A'}\n\nKhông Lấy trước")
+        send_telegram(chat_id, f"🔔 đáo lại cho: {title} - Tổng đáo: ✅ {int(total_val)}\n\nKhông Lấy trước")
         return
-    # compute take_days
-    take_days = int(days_before) if days_before and days_before > 0 else (int(math.ceil(pre_amount / per_day)) if per_day else 0)
+
+    # tính số ngày cần tạo
+    take_days = int(days_before) if days_before > 0 else int(math.ceil(pre_amount / per_day)) if per_day else 0
     if take_days <= 0:
-        send_telegram(chat_id, "⚠️ Không tính được số ngày để tạo.")
+        send_telegram(chat_id, f"⚠️ Không xác định được số ngày hợp lệ cho {title}")
         return
+
     start = datetime.now().date() + timedelta(days=1)
     created = []
     failed = []
+
     for i in range(take_days):
         d = start + timedelta(days=i)
+        # tạo properties chuẩn khớp DB của bạn
         props_payload = {
             "Name": {"title": [{"type": "text", "text": {"content": f"{title} - {d.isoformat()}"}}]},
-            DATE_PROP_NAME: {"date": {"start": d.isoformat()}}
+            "Ngày Góp": {"date": {"start": d.isoformat()}},
+            "Tiền": {"number": per_day},   # ✅ sao chép giá trị từ G ngày
+            "Đã Góp": {"checkbox": False},
+            "Lịch G": {"relation": [{"id": source_page_id}]},  # ✅ link về DAO page gốc
         }
-        ok, res = create_page_in_db(NOTION_DATABASE_ID, props_payload)
-        if ok:
-            created.append(res)
-        else:
-            failed.append(res)
-        time.sleep(PATCH_DELAY)
-    # mark source as processed if possible: try to find a checkbox property among DAO_CHECKFIELD_NAMES
+        try:
+            url = "https://api.notion.com/v1/pages"
+            body = {
+                "parent": {"database_id": NOTION_DATABASE_ID},
+                "properties": props_payload
+            }
+            r = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=20)
+            if r.status_code in (200, 201):
+                created.append(r.json())
+            else:
+                failed.append(f"{r.status_code}: {r.text}")
+            time.sleep(PATCH_DELAY)
+        except Exception as e:
+            failed.append(str(e))
+
+    # ✅ tick lại checkbox đáo/thối (nếu có)
     try:
         page = get_page(source_page_id)
         page_props = page.get("properties", {})
-        key = None
-        for candidate in DAO_CHECKFIELD_NAMES:
-            k = find_prop_key(page_props, candidate)
-            if k:
-                key = k
-                break
-        if key:
-            patch_page_properties(source_page_id, {key: {"checkbox": True}})
+        k = find_prop_key(page_props, "Đáo/thối")
+        if k:
+            patch_page_properties(source_page_id, {k: {"checkbox": True}})
     except Exception as e:
-        print("Error ticking dao checkbox:", e)
-    # send summary
-    lines = [f"✅ Đã tạo {len(created)} page cho {title}:"]
+        print("Error updating DAO checkbox:", e)
+
+    # 📨 gửi kết quả
+    lines = [f"✅ Đã tạo {len(created)} page mới cho {title}:"]
     for i, c in enumerate(created, start=1):
         try:
-            date_val = c["properties"][DATE_PROP_NAME]["date"]["start"]
+            date_val = c["properties"]["Ngày Góp"]["date"]["start"]
             lines.append(f"{i}. [{date_val}] {c.get('id')}")
         except:
-            lines.append(f"{i}. {c.get('id')}")
+            lines.append(f"{i}. [Lỗi ngày] {c.get('id')}")
     if failed:
-        lines.append(f"\n⚠️ Failed: {len(failed)}")
+        lines.append(f"\n⚠️ Lỗi khi tạo: {len(failed)}")
+        for f in failed:
+            lines.append(f"- {f}")
     send_long_text(chat_id, "\n".join(lines))
+
 
 # ---------------- Dispatcher & webhook ----------------
 def handle_text_message(chat_id: int, text: str):
