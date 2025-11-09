@@ -240,6 +240,17 @@ def extract_prop_text(props: Dict[str, Any], key_name: str) -> str:
         return (prop.get("phone_number") or "").strip()
 
     return ""
+# -------------------- RICH TEXT HELPER --------------------
+def extract_plain_text_from_rich_text(arr: List[Dict[str, Any]]) -> str:
+    """
+    Trả về text thuần từ mảng rich_text hoặc title Notion
+    """
+    if not arr:
+        return ""
+    try:
+        return "".join([t.get("plain_text", "") for t in arr])
+    except Exception:
+        return ""
 
 def parse_money_from_text(s: Optional[str]) -> float:
     if not s:
