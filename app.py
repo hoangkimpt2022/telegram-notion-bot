@@ -625,6 +625,9 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
             create_lai_page(chat_id, title, lai_amt, relation_target_id)
         else:
             send_telegram(chat_id, f"ℹ️ Không có giá trị Lãi hoặc chưa cấu hình LA_NOTION_DATABASE_ID. Bỏ qua tạo Lãi.")
+        except Exception as e:
+        send_telegram(chat_id, f"❌ Lỗi tiến trình đáo cho {title}: {str(e)}")
+        traceback.print_exc()
 
 # ------------- PENDING / SELECTION PROCESSING -------------
 def parse_user_selection_text(sel_text: str, found_len: int) -> List[int]:
