@@ -411,19 +411,27 @@ def count_checked_unchecked(keyword: str) -> Tuple[int, int]:
     results = query_database_all(NOTION_DATABASE_ID, page_size=MAX_QUERY_PAGE_SIZE)
     checked = 0
     unchecked = 0
-    kw = normalize_text(keyword)
+
+    # chuẩn hoá keyword
+    kw_clean = normalize_text(keyword)
+
     for p in results:
         props = p.get("properties", {})
         title = extract_prop_text(props, "Name") or ""
-        if kw in normalize_text(title):
+        title_clean = normalize_text(title)
+
+        # 🔒 chỉ match chính xác tên (không chứa chuỗi con)
+        if title_clean == kw_clean:
             key = find_prop_key(props, "Đã Góp") or find_prop_key(props, "Sent") or find_prop_key(props, "Status")
             checked_flag = False
             if key and props.get(key, {}).get("type") == "checkbox":
                 checked_flag = bool(props.get(key, {}).get("checkbox"))
+
             if checked_flag:
                 checked += 1
             else:
                 unchecked += 1
+
     return checked, unchecked
 
 def mark_pages_by_indices(chat_id: str, keyword: str, matches: List[Tuple[str, str, Optional[str], Dict[str, Any]]], indices: List[int]) -> Dict[str, Any]:
@@ -945,6 +953,7 @@ def handle_incoming_message(chat_id: int, text: str):
 
         # --- INTERACTIVE MARK MODE ---
         matches = find_calendar_matches(kw)
+        send_telegram(chat_id, f"🔍 Đang tìm '{kw}' ... 🔄")
         checked, unchecked = count_checked_unchecked(kw)
 
         # nếu không có mục chưa tích vẫn hiển thị thống kê
