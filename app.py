@@ -145,41 +145,100 @@ def check_prop_exists(database_id: str, prop_name: str) -> bool:
         return False
 
 # -------------------- PROPERTY/EXTRACTION HELPERS --------------------
-def find_prop_key(props: Dict[str, Any], name_like: str) -> Optional[str]:
-    for k in props.keys():
-        if normalize_text(k) == normalize_text(name_like):
+def find_prop_key(props: Dict[str, Any], want: str) -> Optional[str]:
+    if not props:
+        return None
+    for k in props:
+        if k.lower() == want.lower():
+            return k
+    for k in props:
+        if want.lower() in k.lower():
             return k
     return None
 
-def extract_prop_text(props: Dict[str, Any], key_like: str) -> str:
+def extract_prop_text(props: Dict[str, Any], key_name: str) -> str:
     """
-    Extract human readable text / number from a property dict.
+    Trả về nội dung text/number/string của 1 property Notion (hỗ trợ rollup, formula, date, checkbox, v.v.)
     """
     if not props:
         return ""
-    k = find_prop_key(props, key_like)
-    if not k:
+
+    # --- tìm key không phân biệt hoa thường ---
+    key = None
+    for k in props:
+        if k.lower() == key_name.lower():
+            key = k
+            break
+    if not key:
+        for k in props:
+            if key_name.lower() in k.lower():
+                key = k
+                break
+    if not key:
         return ""
-    v = props.get(k) or {}
-    t = v.get("type")
-    if t == "title":
-        arr = v.get("title", [])
-        return "".join([x.get("plain_text", "") for x in arr])
-    if t == "rich_text":
-        arr = v.get("rich_text", [])
-        return "".join([x.get("plain_text", "") for x in arr])
-    if t == "number":
-        return str(v.get("number"))
-    if t == "checkbox":
-        return "1" if v.get("checkbox") else "0"
-    if t == "date":
-        d = v.get("date") or {}
-        return d.get("start") or ""
-    if t == "relation":
-        rels = v.get("relation", [])
-        if rels:
-            # return first relation id
-            return rels[0].get("id") or ""
+
+    prop = props.get(key, {})
+    ptype = prop.get("type")
+
+    # --- formula ---
+    if ptype == "formula":
+        f = prop.get("formula", {})
+        t = f.get("type")
+        if t == "string":
+            return (f.get("string") or "").strip()
+        if t == "number" and f.get("number") is not None:
+            return str(f.get("number")).strip()
+        if t == "boolean":
+            return str(f.get("boolean")).strip()
+        if t == "date" and f.get("date"):
+            return f["date"].get("start", "").strip()
+        return ""
+
+    # --- rollup ---
+    if ptype == "rollup":
+        r = prop.get("rollup", {})
+        rtype = r.get("type")
+        if rtype == "number":
+            return str(r.get("number") or "").strip()
+        if rtype == "array":
+            texts = []
+            for item in r.get("array", []):
+                if "plain_text" in item:
+                    texts.append(item["plain_text"])
+                elif "title" in item:
+                    texts.append("".join(t.get("plain_text", "") for t in item["title"]))
+                elif "number" in item and item["number"] is not None:
+                    texts.append(str(item["number"]))
+            return ", ".join(texts).strip()
+        return ""
+
+    # --- các kiểu thường ---
+    if ptype == "title":
+        return extract_plain_text_from_rich_text(prop.get("title", [])).strip()
+    if ptype == "rich_text":
+        return extract_plain_text_from_rich_text(prop.get("rich_text", [])).strip()
+    if ptype == "number":
+        return str(prop.get("number") or "").strip()
+    if ptype == "select":
+        sel = prop.get("select") or {}
+        return (sel.get("name") or "").strip()
+    if ptype == "multi_select":
+        return ", ".join([x.get("name", "") for x in (prop.get("multi_select") or [])]).strip()
+    if ptype == "date":
+        d = prop.get("date") or {}
+        return (d.get("start") or "").strip()
+    if ptype == "checkbox":
+        return str(prop.get("checkbox")).strip()
+    if ptype == "people":
+        arr = prop.get("people") or []
+        return ", ".join([a.get("name", "") for a in arr]).strip()
+    if ptype == "url":
+        return (prop.get("url") or "").strip()
+    if ptype == "email":
+        return (prop.get("email") or "").strip()
+    if ptype == "phone_number":
+        return (prop.get("phone_number") or "").strip()
+
     return ""
 
 def parse_money_from_text(s: Optional[str]) -> float:
@@ -431,46 +490,38 @@ def create_lai_page_from_target(chat_id: str, key_name: str, target_props: Dict[
         send_telegram(chat_id, f"❌ Lỗi tạo Lãi: {e}")
         return False, str(e)
 
-def dao_create_pages_from_props(chat_id: str, source_page_id: str, props: Dict[str, Any]) -> Dict[str, Any]:
+def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Full dao process:
-    - archive all pages in NOTION_DATABASE_ID for key
-    - create take_days pages starting tomorrow (Đã Góp = True), Lịch G relation -> source_page_id
-    - create Lãi page in LA_NOTION_DATABASE_ID (Name=key, Lai from target props, Lịch G -> source_page_id)
+    Xử lý đáo:
+     - archive toàn bộ page của 'key' trong NOTION_DATABASE_ID (checked + unchecked)
+     - tạo `take_days` page mới (Đã Góp = True)
+     - tạo 1 page Lãi trong LA_NOTION_DATABASE_ID (nếu có)
     """
     try:
-        # extract key name
-        name_prop_key = find_prop_key(props, "Name") or find_prop_key(props, "Tên")
-        title = "UNKNOWN"
-        if name_prop_key:
-            v = props.get(name_prop_key, {})
-            if v.get("type") == "title":
-                title = "".join([x.get("plain_text", "") for x in v.get("title", [])]) or title
-        # compute financial numbers
-        total_text = extract_prop_text(props, "Đáo/thối") or extract_prop_text(props, "Đáo")
-        total_val = parse_money_from_text(total_text)
+        title = extract_prop_text(props, "Name") or "UNKNOWN"
+        total_val = parse_money_from_text(extract_prop_text(props, "Đáo/thối"))
         per_day = parse_money_from_text(extract_prop_text(props, "G ngày"))
         days_before = int(float(extract_prop_text(props, "ngày trước") or "0"))
         pre_amount = parse_money_from_text(extract_prop_text(props, "trước"))
+
         if pre_amount == 0:
             send_telegram(chat_id, f"🔔 đáo lại cho: {title} - Tổng đáo: ✅ {int(total_val) if total_val else 'N/A'}\n\nKhông Lấy trước")
             return {"ok": True, "note": "no_pre"}
-        take_days = days_before if days_before and days_before > 0 else (int(math.ceil(pre_amount / per_day)) if per_day else 0)
+
+        take_days = days_before if days_before > 0 else (int(math.ceil(pre_amount / per_day)) if per_day else 0)
         if take_days <= 0:
             send_telegram(chat_id, f"⚠️ Không xác định được số ngày hợp lệ cho {title}.")
             return {"ok": False, "error": "invalid_take_days"}
-        # 1) archive existing pages
-        send_telegram(chat_id, f"🧹 Đang archive toàn bộ page của {title} trước khi tạo mới...")
-        archive_res = handle_command_archive(chat_id, title, auto_confirm_all=True)
-        if not archive_res.get("ok"):
-            send_telegram(chat_id, f"⚠️ Lỗi khi archive trước khi đáo: {archive_res.get('error')}")
-        send_telegram(chat_id, f"🧾 Đã hoàn tất xoá toàn bộ page cũ của {title}, chuẩn bị tạo ngày mới...")
-        # 2) create new pages
+
+        # 1) archive các page cũ
+        send_telegram(chat_id, f"🧹 Đang archive toàn bộ page của {title}...")
+        handle_command_archive(chat_id, title, auto_confirm_all=True)
+
+        # 2) tạo page mới
         start = datetime.now().date() + timedelta(days=1)
         created = []
-        send_telegram(chat_id, f"🛠️ Đang tạo {take_days} ngày mới cho {title} (bắt đầu từ ngày mai)...")
-        for i in range(1, take_days + 1):
-            d = start + timedelta(days=(i - 1))
+        for i in range(take_days):
+            d = start + timedelta(days=i)
             props_payload = {
                 "Name": {"title": [{"type": "text", "text": {"content": f"{title} - {d.isoformat()}"}}]},
                 "Ngày": {"date": {"start": d.isoformat()}},
@@ -481,12 +532,13 @@ def dao_create_pages_from_props(chat_id: str, source_page_id: str, props: Dict[s
             ok, res = create_page_in_db(NOTION_DATABASE_ID, props_payload)
             if ok:
                 created.append(res)
-                send_progress(chat_id, i, take_days, f"📅 Đang tạo ngày mới cho {title}")
+                send_progress(chat_id, i + 1, take_days, f"📅 Đang tạo ngày mới cho {title}")
             else:
                 send_telegram(chat_id, f"⚠️ Lỗi tạo page: {res}")
             time.sleep(PATCH_DELAY)
         send_telegram(chat_id, f"✅ Đã tạo {len(created)} ngày mới cho {title}.")
-        # 3) create Lãi page referencing the source page id from TARGET DB
+
+        # 3) tạo page Lãi
         send_telegram(chat_id, f"💸 Tiếp tục tạo Lãi cho {title}...")
         ok_l, res_l = create_lai_page_from_target(chat_id, title, props, source_page_id)
         if not ok_l:
