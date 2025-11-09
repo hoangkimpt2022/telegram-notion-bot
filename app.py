@@ -393,14 +393,9 @@ def dao_preview_text_from_props(title: str, props: Dict[str, Any]) -> Tuple[bool
 
             lines = [
                 f"🔔 Đáo lại cho: {title} - Tổng CK: ✅ {int(total_val)}",
-                "",
-                f"Lấy trước: {take_days} ngày {int(per_day)} là {total_pre} \n (bắt đầu từ ngày mai):",
-                ""
-            ]
+                f"Lấy trước: {take_days} ngày {int(per_day)} là {total_pre} \n (bắt đầu từ ngày mai):",]           
             for idx, d in enumerate(date_list, start=1):
-                lines.append(f"{idx}. {d}")
-            lines.append("")
-            lines.append(f" /ok  {take_days}  /cancel .")
+                lines.append(f"{idx}. {d}")          
             return True, "\n".join(lines)
 
         # fallback: không có emoji
@@ -604,7 +599,11 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
         send_telegram(chat_id, f"✅ Đã xóa xong {deleted}/{total_to_delete} mục của {title}.")
 
         # --- 2️⃣ TẠO PAGE MỚI ---
-        start = datetime.now().date() + timedelta(days=1)
+        from datetime import timezone
+        VN_TZ = timezone(timedelta(hours=7))
+        now_vn = datetime.now(VN_TZ)
+        start = now_vn.date() + timedelta(days=1)
+        date_list = [(start + timedelta(days=i)).isoformat() for i in range(take_days)]
         created = []
         send_telegram(chat_id, f"🛠️ Đang tạo {take_days} ngày mới cho {title} (bắt đầu từ ngày mai)...")
 
@@ -642,12 +641,12 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
             create_lai_page(chat_id, title, lai_amt, relation_target_id)
         else:
             send_telegram(chat_id, f"ℹ️ Không có giá trị Lãi hoặc chưa cấu hình LA_NOTION_DATABASE_ID. Bỏ qua tạo Lãi.")
-    
+        send_telegram(chat_id, "✅ Hoàn thành tiến trình đáo! 🎉")
     except Exception as e:
         send_telegram(chat_id, f"❌ Lỗi tiến trình đáo cho {title}: {str(e)}")
         traceback.print_exc()
         return
-
+    
 # ------------- PENDING / SELECTION PROCESSING -------------
 def parse_user_selection_text(sel_text: str, found_len: int) -> List[int]:
     """Parse selection input like '1', '1,2', '1-3', 'all', or '3' (meaning 1..3)."""
