@@ -19,6 +19,8 @@ import traceback
 import threading
 import requests
 import unicodedata
+import threading, time, requests
+from datetime import datetime, timedelta, timezone
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from flask import Flask, request, jsonify
@@ -1067,7 +1069,29 @@ def telegram_webhook():
     # ✅ Quan trọng: trả lại JSON để Telegram biết bot đã nhận
     return jsonify({"ok": True})
 
+def auto_ping_render():
+    """
+    Giữ Render hoạt động trong khung giờ 9:00 - 23:59 (UTC+7)
+    """
+    RENDER_URL = "https://your-app-name.onrender.com"  # ⚠️ anh đổi thành URL thật của app Flask (https://tên-app.onrender.com)
+    VN_TZ = timezone(timedelta(hours=7))
 
+    while True:
+        now_vn = datetime.now(VN_TZ)
+        hour = now_vn.hour
+
+        # chỉ ping trong khung giờ 9h - 23h59 (giờ VN)
+        if 9 <= hour < 24:
+            try:
+                r = requests.get(RENDER_URL, timeout=10)
+                print(f"[{now_vn:%H:%M:%S}] 🔄 Ping Render: {r.status_code}")
+            except Exception as e:
+                print(f"[{now_vn:%H:%M:%S}] ⚠️ Ping lỗi: {e}")
+        else:
+            print(f"[{now_vn:%H:%M:%S}] 🌙 Ngoài giờ làm việc — không ping.")
+
+        # đợi 5 phút rồi ping lại
+        time.sleep(300)  # 30780s = 13 phút
 
 # ------------- RUN (local test) -------------
 if __name__ == "__main__":
@@ -1077,4 +1101,7 @@ if __name__ == "__main__":
     print("TARGET_NOTION_DATABASE_ID:", TARGET_NOTION_DATABASE_ID[:8] + "..." if TARGET_NOTION_DATABASE_ID else "(none)")
     print("LA_NOTION_DATABASE_ID:", LA_NOTION_DATABASE_ID[:8] + "..." if LA_NOTION_DATABASE_ID else "(none)")
     print("TELEGRAM_TOKEN set?:", bool(TELEGRAM_TOKEN))
+    threading.Thread(target=auto_ping_render, daemon=True).start()
     app.run(host="0.0.0.0", port=port)
+
+
