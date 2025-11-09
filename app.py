@@ -861,17 +861,15 @@ def sweep_pending_expirations():
 threading.Thread(target=sweep_pending_expirations, daemon=True).start()
 
 # ------------- FLASK APP / WEBHOOK -------------
+# ------------- FLASK APP / WEBHOOK -------------
 app = Flask(__name__)
 
+# ✅ Route kiểm tra app đang chạy
 @app.route("/", methods=["GET"])
 def index():
     return "app_final_v4 running ✅"
 
-# support both /telegram_webhook and /webhook to avoid misconfig
-@app.route("/", methods=["GET"])
-def index():
-    return "app_final_v4 running ✅"
-
+# ✅ Route chính cho Telegram webhook (và dự phòng)
 @app.route("/telegram_webhook", methods=["POST"])
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
@@ -879,17 +877,28 @@ def telegram_webhook():
         data = request.get_json(force=True)
     except Exception:
         return jsonify({"ok": False, "error": "invalid json"}), 400
+
     if not data:
         return jsonify({"ok": False, "error": "no data"}), 400
+
     message = data.get("message") or data.get("edited_message") or {}
     if not message:
         return jsonify({"ok": True})
+
     chat = message.get("chat", {})
     chat_id = chat.get("id")
     text = message.get("text") or message.get("caption") or ""
+
     if chat_id and text:
-        threading.Thread(target=handle_incoming_message, args=(chat_id, text), daemon=True).start()
+        threading.Thread(
+            target=handle_incoming_message,
+            args=(chat_id, text),
+            daemon=True
+        ).start()
+
+    # ✅ Quan trọng: trả lại JSON để Telegram biết bot đã nhận
     return jsonify({"ok": True})
+
 
 
 # ------------- RUN (local test) -------------
