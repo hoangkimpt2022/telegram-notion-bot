@@ -783,43 +783,54 @@ def process_pending_selection(chat_id: str, raw: str):
             del pending_confirm[key]
 
 # ------------- Command parsing & main handler -------------
-def parse_user_command(raw: str) -> Tuple[str, int, str]:
-    txt = raw.strip()
-    low = txt.lower()
-    parts = txt.split()
-    if not parts:
-        return "", 0, "unknown"
-    if low in ("undo",):
-        return "", 0, "undo"
-    if low.endswith(" đáo") or low.endswith(" dao"):
-        kw = txt.rsplit(None, 1)[0]
-        return kw, 0, "dao"
-    if low.endswith(" xóa") or low.endswith(" xoa"):
-        kw = txt.rsplit(None, 1)[0]
-        return kw, 0, "archive"
-    keyword = parts[0]
-    action = "mark"
+def parse_user_command(raw: str) -> Tuple[str, int, Optional[str]]:
+    """
+    Phân tích lệnh Telegram: tách keyword, count, action.
+    Ví dụ:
+      'gam' -> ('gam', 0, None)
+      'gam 2' -> ('gam', 2, 'mark')
+      'gam xóa' -> ('gam', 0, 'archive')
+      'gam đáo' -> ('gam', 0, 'dao')
+      'undo' -> ('', 0, 'undo')
+    """
+    raw = raw.strip()
+    if not raw:
+        return "", 0, None
+
+    parts = raw.split()
+    kw = parts[0]
     count = 0
-    if len(parts) >= 2:
-        sec = parts[1]
-        if sec.isdigit():
-            count = int(sec)
-    return keyword, count, action
+    action = None
+
+    # --- AUTO MARK (vd: gam 2) ---
+    if len(parts) > 1 and parts[1].isdigit():
+        count = int(parts[1])
+        action = "mark"
+
+    # --- UNDO ---
+    elif raw.lower() in ("undo", "/undo"):
+        action = "undo"
+
+    # --- ARCHIVE ---
+    elif any(x in raw.lower() for x in ["xóa", "archive", "del", "delete"]):
+        action = "archive"
+
+    # --- ĐÁO ---
+    elif any(x in raw.lower() for x in ["đáo", "dao", "daó", "đáo hạn"]):
+        action = "dao"
+
+    return kw, count, action
 
 def handle_incoming_message(chat_id: int, text: str):
     """
     Main entry point for Telegram messages.
-    Cập nhật:
-    - Gửi thông báo tiến trình với emoji
-    - Hỗ trợ phản hồi tức thì (threading)
-    - Hiển thị khi không có mục chưa tích
     """
     try:
-        matches = []
+        matches = []  # ✅ khởi tạo tránh lỗi UnboundLocalError
         kw = ""
         count = 0
 
-        # kiểm tra quyền chat id (nếu có giới hạn)
+        # optional restrict by chat id
         if TELEGRAM_CHAT_ID and str(chat_id) != str(TELEGRAM_CHAT_ID):
             send_telegram(chat_id, "Bot chưa được phép nhận lệnh từ chat này.")
             return
@@ -831,13 +842,12 @@ def handle_incoming_message(chat_id: int, text: str):
 
         low = raw.lower()
 
-        # --- kiểm tra pending confirm (đáo / mark / archive) ---
+        # pending confirm (dao / mark / archive)
         if str(chat_id) in pending_confirm:
             if low in ("/cancel", "cancel", "hủy", "huy"):
                 del pending_confirm[str(chat_id)]
                 send_telegram(chat_id, "Đã hủy thao tác đang chờ.")
                 return
-
             pc = pending_confirm[str(chat_id)]
             if pc.get("type") in ("dao_choose", "dao_confirm"):
                 threading.Thread(target=process_pending_selection_for_dao, args=(chat_id, raw), daemon=True).start()
@@ -845,136 +855,151 @@ def handle_incoming_message(chat_id: int, text: str):
             threading.Thread(target=process_pending_selection, args=(chat_id, raw), daemon=True).start()
             return
 
-        # --- các lệnh huỷ ---
         if low in ("/cancel", "cancel", "hủy", "huy"):
             send_telegram(chat_id, "Không có thao tác đang chờ. /cancel ignored.")
             return
 
         # --- PHÂN TÍCH LỆNH ---
         keyword, count, action = parse_user_command(raw)
-        kw = keyword
+        kw = keyword  # giữ lại cho auto-mark
 
         # --- AUTO-MARK MODE ---
-        if action == "mark" and count > 0:
-            send_telegram(chat_id, f"🔍 Đang xử lý tìm '{kw}' ... 🌀")
+        if action == "mark" and count > 0: 
+            send_telegram(chat_id, f"🔍 Đang xử lý tìm '{kw}' ... 🔄")
+            matches = find_calendar_matches(kw)
+            if not matches:
+                send_telegram(chat_id, f"Không tìm thấy mục nào cho '{kw}'.")
+                return
+            # sắp xếp theo ngày tăng (cũ nhất trước)
+            matches.sort(key=lambda x: x[2] or "")
+            selected_indices = list(range(1, min(count, len(matches)) + 1))
+            res = mark_pages_by_indices(chat_id, kw, matches, selected_indices)
 
-            def run_auto_mark():
-                matches = find_calendar_matches(kw)
-                checked, unchecked = count_checked_unchecked(kw)
-
-                if not matches or unchecked == 0:
-                    msg = (
-                        f"🔎 '{kw}'\n\n"
-                        f"✅ Đã tích: {checked}\n"
-                        f"🟡 Chưa tích: {unchecked}\n\n"
-                        f"💫 Không có mục chưa tích."
-                    )
-                    send_telegram(chat_id, msg)
-                    return
-
-                matches.sort(key=lambda x: x[2] or "")
-                selected_indices = list(range(1, min(count, len(matches)) + 1))
-                res = mark_pages_by_indices(chat_id, kw, matches, selected_indices)
-
-                if res.get("succeeded"):
-                    txt = "✅ Đã tự động tích:\n"
-                    for pid, title, date_iso in res["succeeded"]:
-                        ds = date_iso[:10] if date_iso else "-"
-                        txt += f"{ds} — {title}\n"
-                    send_long_text(chat_id, txt)
-
-                if res.get("failed"):
-                    send_telegram(chat_id, f"⚠️ Có {len(res['failed'])} mục đánh dấu lỗi.")
-
-                checked, unchecked = count_checked_unchecked(kw)
-                send_telegram(chat_id, f"📊 Đã tích: {checked}\n🟡 Chưa tích: {unchecked}")
-                send_telegram(chat_id, f"✅ Hoàn tất auto-mark cho '{kw}'! 🎉")
-
-            threading.Thread(target=run_auto_mark, daemon=True).start()
+            if res.get("succeeded"):
+                txt = "✅ Đã tự động tích:\n"
+                for pid, title, date_iso in res["succeeded"]:
+                    ds = date_iso[:10] if date_iso else "-"
+                    txt += f"{ds} — {title}\n"
+                send_long_text(chat_id, txt)
+            if res.get("failed"):
+                send_telegram(chat_id, f"⚠️ Có {len(res['failed'])} mục đánh dấu lỗi.")
+            checked, unchecked = count_checked_unchecked(kw)
+            send_telegram(chat_id, f"✅ Đã tích: {checked}\n🟡 Chưa tích: {unchecked}")
             return
 
         # --- UNDO ---
-        if action == "undo":
+        if action == "undo": 
             send_telegram(chat_id, "♻️ Đang hoàn tác hành động gần nhất ...")
-            def run_undo():
-                undo_last(chat_id, 1)
-                send_telegram(chat_id, "✅ Hoàn tất hoàn tác! 👍")
-            threading.Thread(target=run_undo, daemon=True).start()
+            send_telegram(chat_id, "Đang tìm và undo...")
+            threading.Thread(target=undo_last, args=(chat_id, 1), daemon=True).start()
             return
+            send_telegram(chat_id, "✅ Hoàn tất hoàn tác! 👍")
 
         # --- ARCHIVE ---
-        if action == "archive":
+        if action == "archive": 
             send_telegram(chat_id, f"🗑️ Đang xử lý archive '{kw}' ... ⏳")
-
-            def run_archive():
-                kw_local = kw
-                matches = find_matching_all_pages_in_db(NOTION_DATABASE_ID, kw_local, limit=5000)
-                checked, unchecked = count_checked_unchecked(kw_local)
-                header = (
-                    f"🔎 '{kw_local}'\n\n"
-                    f"✅ Đã tích: {checked}\n"
-                    f"🟡 Chưa tích: {unchecked}\n\n"
-                    f"⚠️ Bạn sắp archive {len(matches)} mục chứa '{kw_local}'. "
-                    f"Gửi số (1-7), 'all' hoặc /cancel.\n\n"
-                )
-                lines = []
-                for i, (pid, title, date_iso) in enumerate(matches, start=1):
-                    ds = date_iso[:10] if date_iso else "-"
-                    lines.append(f"{i}. [{ds}] {title}")
-                send_long_text(chat_id, header + "\n".join(lines))
-                pending_confirm[str(chat_id)] = {
-                    "type": "archive_select",
-                    "keyword": kw_local,
-                    "matches": matches,
-                    "expires": time.time() + WAIT_CONFIRM,
-                }
-                send_telegram(chat_id, f"✅ Hoàn thành archive cho '{kw_local}'! 🎉")
-
-            threading.Thread(target=run_archive, daemon=True).start()
+            kw = keyword
+            matches = find_matching_all_pages_in_db(NOTION_DATABASE_ID, kw, limit=5000)
+            checked, unchecked = count_checked_unchecked(kw)
+            header = f"🔎 '{kw}'\n\n✅ Đã tích: {checked}\n🟡 Chưa tích: {unchecked}\n\n"
+            header += f"⚠️ Bạn sắp archive {len(matches)} mục chứa '{kw}'. Gửi số (1-7), 'all' hoặc /cancel.\n\n"
+            lines = []
+            for i, (pid, title, date_iso) in enumerate(matches, start=1):
+                ds = date_iso[:10] if date_iso else "-"
+                lines.append(f"{i}. [{ds}] {title}")
+            send_long_text(chat_id, header + "\n".join(lines))
+            pending_confirm[str(chat_id)] = {"type": "archive_select", "keyword": kw, "matches": matches, "expires": time.time() + WAIT_CONFIRM}
             return
-
+            send_telegram(chat_id, f"✅ Hoàn thành archive cho '{kw}'! 🎉")
         # --- ĐÁO ---
-        if action == "dao":
+        if action == "dao": 
             send_telegram(chat_id, f"💼 Đang xử lý đáo cho '{kw}' ... ⏳")
-            def run_dao():
-                matches = find_target_matches(kw)
-                if not matches:
-                    send_telegram(chat_id, f"⚠️ Không tìm thấy '{kw}' trong DB đáo.")
-                    return
-
-                if len(matches) > 1:
-                    header = f"Tìm thấy {len(matches)} kết quả cho '{kw}'. Chọn index để tiếp tục."
-                    lines = []
-                    for i, (pid, title, props) in enumerate(matches, start=1):
-                        dt = extract_prop_text(props, "Đáo/thối") or "-"
-                        gday = extract_prop_text(props, "G ngày") or "-"
-                        nb = extract_prop_text(props, "ngày trước") or "-"
-                        prev = extract_prop_text(props, "trước") or "-"
-                        lines.append(f"{i}. {title} — Đáo/thối: {dt} — G ngày: {gday} — # ngày trước: {nb} — trước: {prev}")
-                    send_long_text(chat_id, header + "\n\n" + "\n".join(lines))
-                    pending_confirm[str(chat_id)] = {"type": "dao_choose", "matches": matches, "expires": time.time() + WAIT_CONFIRM}
-                    send_telegram(chat_id, f"📤 Gửi số (ví dụ 1 hoặc 1-3) trong {WAIT_CONFIRM}s để chọn, hoặc /cancel.")
-                    return
-
-                # single match
-                pid, title, props = matches[0]
-                can, preview = dao_preview_text_from_props(title, props)
-                send_long_text(chat_id, preview)
-                if can:
-                    pending_confirm[str(chat_id)] = {"type": "dao_confirm", "source_page_id": pid, "props": props, "expires": time.time() + WAIT_CONFIRM}
-                    send_telegram(chat_id, f"✅ Có thể đáo cho '{title}'. Gõ /ok để thực hiện trong {WAIT_CONFIRM}s hoặc /cancel để hủy.")
-                else:
-                    send_telegram(chat_id, f"⚠️ Không thể thực hiện đáo cho '{title}'. Vui lòng kiểm tra dữ liệu.")
-            threading.Thread(target=run_dao, daemon=True).start()
+            kw = keyword
+            matches = find_target_matches(kw)
+            if not matches:
+                send_telegram(chat_id, f"⚠️ Không tìm thấy '{kw}' trong DB đáo.")
+                return
+            if len(matches) > 1:
+                header = f"Tìm thấy {len(matches)} kết quả cho '{kw}'. Chọn index để tiếp tục."
+                lines = []
+                for i, (pid, title, props) in enumerate(matches, start=1):
+                    dt = extract_prop_text(props, "Đáo/thối") or "-"
+                    gday = extract_prop_text(props, "G ngày") or "-"
+                    nb = extract_prop_text(props, "ngày trước") or "-"
+                    prev = extract_prop_text(props, "trước") or "-"
+                    lines.append(f"{i}. {title} — Đáo/thối: {dt} — G ngày: {gday} — # ngày trước: {nb} — trước: {prev}")
+                send_long_text(chat_id, header + "\n\n" + "\n".join(lines))
+                pending_confirm[str(chat_id)] = {"type": "dao_choose", "matches": matches, "expires": time.time() + WAIT_CONFIRM}
+                send_telegram(chat_id, f"📤 Gửi số (ví dụ 1 hoặc 1-3) trong {WAIT_CONFIRM}s để chọn, hoặc /cancel.")
+                return
+            pid, title, props = matches[0]
+            can, preview = dao_preview_text_from_props(title, props)
+            send_long_text(chat_id, preview)
+            if can:
+                pending_confirm[str(chat_id)] = {"type": "dao_confirm", "source_page_id": pid, "props": props, "expires": time.time() + WAIT_CONFIRM}
+                send_telegram(chat_id, f"✅ Có thể đáo cho '{title}'. Gõ /ok để thực hiện trong {WAIT_CONFIRM}s hoặc /cancel để hủy.")
+            else:
+                send_telegram(chat_id, f"⚠️ Không thể thực hiện đáo cho '{title}'. Vui lòng kiểm tra dữ liệu.")
             return
+            send_telegram(chat_id, f"✅ Hoàn thành tiến trình đáo cho '{title}'! 🎉")
 
-        # --- MẶC ĐỊNH (chưa có hành động cụ thể) ---
-        send_telegram(chat_id, f"🤖 Không hiểu lệnh '{text}'. Vui lòng thử lại hoặc gõ /help.")
+
+        # --- INTERACTIVE MARK MODE ---
+        matches = find_calendar_matches(kw)
+        checked, unchecked = count_checked_unchecked(kw)
+
+        # nếu không có mục chưa tích vẫn hiển thị thống kê
+        if not matches or unchecked == 0:
+            msg = (f"🔎 '{kw}'\n\n" f"✅ Đã góp: {checked}\n"f"🟡 Chưa góp: {unchecked}\n"f"💫 Không có mục chưa tích.")                      
+            send_telegram(chat_id, msg)
+            return
+        header = f"🔎 '{kw}'\n✅ Đã góp: {checked}\n🟡 Chưa góp: {unchecked}\n📤 /cancel.\n"
+        lines = []
+        for i, (pid, title, date_iso, props) in enumerate(matches, start=1):
+            ds = date_iso[:10] if date_iso else "-"
+            lines.append(f"{i}. [{ds}] {title}")
+        send_long_text(chat_id, header + "\n".join(lines))
+        pending_confirm[str(chat_id)] = {"type": "mark", "keyword": kw, "matches": matches, "expires": time.time() + WAIT_CONFIRM}
 
     except Exception as e:
         traceback.print_exc()
         send_telegram(chat_id, f"❌ Lỗi xử lý: {e}")
 
+        # default: mark flow
+        kw = keyword
+        matches = find_calendar_matches(kw)
+        checked, unchecked = count_checked_unchecked(kw)
+        header = f"🔎 : '{kw}'\n\n✅ Đã tích: {checked}\n\n🟡 Chưa tích: {unchecked}\n\n"
+        header += f"📤 Gửi số ( ví dụ 1 hoặc 1-3 ) trong {WAIT_CONFIRM}s để chọn, hoặc /cancel.\n\n"
+        if not matches:
+            send_telegram(chat_id, f"Không tìm thấy mục nào chưa tích cho '{kw}'.")
+            return
+        lines = []
+        for i, (pid, title, date_iso, props) in enumerate(matches, start=1):
+            ds = date_iso[:10] if date_iso else "-"
+            lines.append(f"{i}. [{ds}] {title}")
+        send_long_text(chat_id, header + "\n".join(lines))
+        pending_confirm[str(chat_id)] = {"type": "mark", "keyword": kw, "matches": matches, "expires": time.time() + WAIT_CONFIRM}
+    except Exception as e:
+        traceback.print_exc()
+        # ⚡ AUTO-MARK MODE: nếu user gõ "gam 2" thì tự động tích 2 ngày đầu tiên
+        if count > 0 and matches:
+            send_telegram(chat_id, f"⚡ Đang tự động đánh dấu {count} mục cho '{kw}'...")
+            # chọn n mục đầu tiên
+            indices = list(range(1, min(count, len(matches)) + 1))
+            res = mark_pages_by_indices(chat_id, kw, matches, indices)
+            if res.get("succeeded"):
+                txt = "✅ Đã đánh dấu:\n"
+                for pid, title, date_iso in res["succeeded"]:
+                    ds = date_iso[:10] if date_iso else "-"
+                    txt += f"{ds} — {title}\n"
+                send_long_text(chat_id, txt)
+            if res.get("failed"):
+                send_telegram(chat_id, f"⚠️ Có {len(res['failed'])} mục đánh dấu lỗi.")
+            checked, unchecked = count_checked_unchecked(kw)
+            send_telegram(chat_id, f"✅ Đã tích: {checked}\n🟡 Chưa tích: {unchecked}")
+            return
+        send_telegram(chat_id, f"Lỗi xử lý: {e}")
 # ------------- BACKGROUND: sweep expired pending -------------
 def sweep_pending_expirations():
     while True:
