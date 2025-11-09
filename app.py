@@ -293,44 +293,47 @@ def find_calendar_matches(keyword: str) -> List[Tuple[str, str, Optional[str], D
     """Return unchecked pages in NOTION_DATABASE_ID matching keyword; sorted by date asc."""
     if not NOTION_DATABASE_ID:
         return []
+
     kw = normalize_text(keyword)
     pages = query_database_all(NOTION_DATABASE_ID, page_size=MAX_QUERY_PAGE_SIZE)
     matches: List[Tuple[str, str, Optional[str], Dict[str, Any]]] = []
+
     for p in pages:
         props = p.get("properties", {})
         title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
         title_clean = normalize_text(title)
         kw_clean = normalize_text(kw)
+        date_iso = None  # ✅ khởi tạo tránh lỗi "cannot access local variable"
 
-        # exact match trước
+        # ---- MATCH LOGIC ----
         if title_clean == kw_clean or title_clean.strip() == kw_clean:
             score = 2
-        # bắt đầu bằng keyword (ví dụ: "hương vip")
         elif title_clean.startswith(kw_clean + " "):
             score = 1
-        # khớp mờ thì cho điểm thấp hơn
         elif kw_clean in title_clean:
             score = 0.5
         else:
             continue
-        matches.append((p.get("id"), title, date_iso, props, score))
 
-        # is checked?
+        # ---- CHECKBOX ----
         cb_key = find_prop_key(props, "Đã Góp") or find_prop_key(props, "ĐãGóp") or find_prop_key(props, "Sent") or find_prop_key(props, "Status")
         checked = False
         if cb_key and props.get(cb_key, {}).get("type") == "checkbox":
             checked = bool(props.get(cb_key, {}).get("checkbox"))
         if checked:
-            continue
-        # ✅ Lấy chính xác cột "Ngày Góp"
+            continue  # bỏ qua những mục đã tích
+
+        # ---- NGÀY GÓP ----
         date_key = find_prop_key(props, "Ngày Góp")
-        date_iso = None
         if date_key:
             date_field = props.get(date_key, {})
             if date_field.get("type") == "date":
                 date_iso = date_field["date"].get("start")
+
         matches.append((p.get("id"), title, date_iso, props))
-    matches.sort(key=lambda x: (-x[4], x[2] or ""))
+
+    # ---- SẮP XẾP: Ưu tiên score cao, sau đó theo ngày ----
+    matches.sort(key=lambda x: (-score, x[2] or ""))
     return matches
 
 def find_matching_all_pages_in_db(database_id: str, keyword: str, limit: int = 2000) -> List[Tuple[str, str, Optional[str]]]:
@@ -356,41 +359,59 @@ def find_matching_all_pages_in_db(database_id: str, keyword: str, limit: int = 2
 # ------------- DAO preview & calculations -------------
 def dao_preview_text_from_props(title: str, props: Dict[str, Any]) -> Tuple[bool, str]:
     """
-    Prepare preview string for đáo action.
-    Returns (can_do, message)
+    Sinh nội dung preview cho hành động đáo.
+    Logic:
+      - 🔴 -> chưa thể đáo
+      - ✅ + ngày trước = 0 -> Không lấy trước (chỉ tạo Lãi)
+      - ✅ + ngày trước > 0 -> Lấy trước, tạo page & lãi
     """
     try:
-        total_text = extract_prop_text(props, "Đáo/thối") or extract_prop_text(props, "Đáo") or ""
-        total_val = parse_money_from_text(total_text)
+        dao_text = extract_prop_text(props, "Đáo/thối") or extract_prop_text(props, "Đáo") or ""
+        total_val = parse_money_from_text(dao_text)
         per_day = parse_money_from_text(extract_prop_text(props, "G ngày") or extract_prop_text(props, "Gngày") or "")
-        days_before = int(float(extract_prop_text(props, "ngày trước") or "0"))
-        pre_amount = parse_money_from_text(extract_prop_text(props, "trước") or "")
-        if pre_amount == 0:
-            msg = f"🔔 đáo lại cho: {title} - Tổng đáo: ✅ {int(total_val) if total_val else 'N/A'}\n\nKhông Lấy trước"
-            return True, msg
-        # compute take_days
-        if days_before and days_before > 0:
+        days_before_text = extract_prop_text(props, "ngày trước") or "0"
+        days_before = int(float(days_before_text)) if days_before_text.strip().isdigit() else 0
+
+        # --- Trường hợp 1: emoji 🔴 -> chưa thể đáo ---
+        if "🔴" in dao_text:
+            return False, f"🔔 đáo lại cho: {title} - Tổng đáo: 🔴 {int(total_val)}\n\nchưa thể đáo ."
+
+        # --- Trường hợp 2: emoji ✅ ---
+        if "✅" in dao_text:
+            # Nếu không có "ngày trước" hoặc = 0 → chỉ tạo Lãi
+            if not days_before or days_before <= 0:
+                msg = (
+                    f"🔔 đáo lại cho: {title} - Tổng đáo: ✅ {int(total_val)}\n\n"
+                    f"Không Lấy trước\n\n"
+                    f"Gửi /ok để chỉ tạo Lãi, hoặc /cancel để hủy."
+                )
+                # cho phép /ok nhưng đánh dấu rằng chỉ tạo Lãi
+                props["ONLY_LAI"] = True
+                return True, msg
+
+            # Có số trong "ngày trước" → tạo page & lãi
             take_days = days_before
-        else:
-            take_days = int(math.ceil(pre_amount / per_day)) if per_day else 0
-        if take_days <= 0:
-            return False, f"⚠️ Không xác định số ngày hợp lệ cho {title}. (per_day={per_day}, pre_amount={pre_amount}, days_before={days_before})"
-        lines = [
-            f"🔔 đáo lại cho: {title} - Tổng đáo: ✅ {int(total_val) if total_val else 'N/A'}",
-            "",
-            f"Lấy trước: {take_days} ngày" if take_days else "Không Lấy trước",
-            f"G ngày: {int(per_day) if per_day else 0}",
-            f"Ngày trước: {days_before}",
-            f"Trước: {int(pre_amount) if pre_amount else 0}",
-            "",
-            "Danh sách ngày dự kiến tạo (bắt đầu từ ngày mai):",
-        ]
-        start = datetime.now().date() + timedelta(days=1)
-        for i in range(take_days):
-            lines.append((start + timedelta(days=i)).isoformat())
-        lines.append("")
-        lines.append(f"Gửi /ok để tạo {take_days} page trong {WAIT_CONFIRM}s, hoặc /cancel.")
-        return True, "\n".join(lines)
+            total_pre = int(per_day * take_days) if per_day else 0
+            start = (datetime.utcnow() + timedelta(hours=7)).date() + timedelta(days=1)
+            date_list = [(start + timedelta(days=i)).isoformat() for i in range(take_days)]
+
+            lines = [
+                f"🔔 đáo lại cho: {title} - Tổng đáo: ✅ {int(total_val)}",
+                "",
+                f"Lấy trước: {take_days} ngày {int(per_day)} là {total_pre} (bắt đầu từ ngày mai):",
+                ""
+            ]
+            for idx, d in enumerate(date_list, start=1):
+                lines.append(f"{idx}. {d}")
+            lines.append("")
+            lines.append(f"Gửi /ok để tạo {take_days} page và Lãi, hoặc /cancel để hủy.")
+            return True, "\n".join(lines)
+
+        # fallback: không có emoji
+        msg = f"🔔 đáo lại cho: {title} - Tổng đáo: ✅ {int(total_val)}\n\nKhông Lấy trước\n\nGửi /ok để chỉ tạo Lãi."
+        props["ONLY_LAI"] = True
+        return True, msg
+
     except Exception as e:
         return False, f"Preview error: {e}"
 
@@ -508,8 +529,8 @@ def create_lai_page(chat_id: int, title: str, lai_amount: float, relation_id: st
     """
     Tạo 1 page Lãi trong LA_NOTION_DATABASE_ID với:
      - Name = title
-     - Lãi = lấy số tiền từ cột "Lai lịch g" bên TARGET_NOTION_DATABASE_ID
-     - Ngày Góp = ngày hôm nay
+     - Lai = lấy số tiền từ cột "Lai lich g" bên TARGET_NOTION_DATABASE_ID
+     - ngày lai = ngày hôm nay
      - Lịch G = relation trỏ về page gốc
     """
     try:
@@ -517,8 +538,8 @@ def create_lai_page(chat_id: int, title: str, lai_amount: float, relation_id: st
 
         props_payload = {
             "Name": {"title": [{"type": "text", "text": {"content": title}}]},
-            "Lãi": {"number": lai_amount},
-            "Ngày Góp": {"date": {"start": today}},
+            "Lai": {"number": lai_amount},
+            "ngày lai": {"date": {"start": today}},
             "Lịch G": {"relation": [{"id": relation_id}]}
         }
 
@@ -689,17 +710,34 @@ def process_pending_selection_for_dao(chat_id: str, raw: str):
                 del pending_confirm[key]
                 send_telegram(chat_id, "Đã hủy thao tác đáo.")
                 return
+
             if raw.strip().lower() in ("ok", "/ok", "yes", "đồng ý", "dong y"):
                 source_page_id = data.get("source_page_id")
                 props = data.get("props")
+
+                # ✅ Nếu chỉ tạo Lãi (không tạo page)
+                if props.get("ONLY_LAI"):
+                    title = extract_prop_text(props, "Name") or "UNKNOWN"
+                    lai_text = extract_prop_text(props, "Lai lịch g") or extract_prop_text(props, "Lãi") or extract_prop_text(props, "Lai") or ""
+                    lai_amt = parse_money_from_text(lai_text) or 0
+                    if LA_NOTION_DATABASE_ID and lai_amt > 0:
+                        create_lai_page(chat_id, title, lai_amt, source_page_id)
+                        send_telegram(chat_id, f"💰 Đã tạo Lãi cho {title} (chỉ tạo Lãi, không tạo page).")
+                    else:
+                        send_telegram(chat_id, f"⚠️ Không có giá trị Lãi hoặc chưa cấu hình LA_NOTION_DATABASE_ID.")
+                    del pending_confirm[key]
+                    return
+
+                # ✅ Nếu bình thường → tạo page + lãi
                 dao_create_pages_from_props(chat_id, source_page_id, props)
                 del pending_confirm[key]
                 return
-            send_telegram(chat_id, "Gửi /ok để thực hiện hoặc /cancel để hủy.")
-            return
+
+        send_telegram(chat_id, "Gửi /ok để thực hiện hoặc /cancel để hủy.")
+        return
     except Exception as e:
         traceback.print_exc()
-        send_telegram(chat_id, f"❌ Lỗi xử lý lựa chọn: {e}")
+        send_telegram(chat_id, f"❌ Lỗi xử lý đáo: {e}")
         if key in pending_confirm:
             del pending_confirm[key]
 
@@ -777,17 +815,23 @@ def handle_incoming_message(chat_id: int, text: str):
     Main entry point for Telegram messages.
     """
     try:
+        matches = []  # ✅ khởi tạo tránh lỗi UnboundLocalError
+        kw = ""
+        count = 0
+
         # optional restrict by chat id
         if TELEGRAM_CHAT_ID and str(chat_id) != str(TELEGRAM_CHAT_ID):
             send_telegram(chat_id, "Bot chưa được phép nhận lệnh từ chat này.")
             return
+
         raw = text.strip()
         if not raw:
             send_telegram(chat_id, "Vui lòng gửi lệnh hoặc từ khoá.")
             return
+
         low = raw.lower()
 
-        # if pending confirm exists -> route selection handling
+        # pending confirm (dao / mark / archive)
         if str(chat_id) in pending_confirm:
             if low in ("/cancel", "cancel", "hủy", "huy"):
                 del pending_confirm[str(chat_id)]
@@ -804,20 +848,46 @@ def handle_incoming_message(chat_id: int, text: str):
             send_telegram(chat_id, "Không có thao tác đang chờ. /cancel ignored.")
             return
 
+        # --- PHÂN TÍCH LỆNH ---
         keyword, count, action = parse_user_command(raw)
+        kw = keyword  # giữ lại cho auto-mark
 
+        # --- AUTO-MARK MODE ---
+        if action == "mark" and count > 0:
+            matches = find_calendar_matches(kw)
+            if not matches:
+                send_telegram(chat_id, f"Không tìm thấy mục nào cho '{kw}'.")
+                return
+            # sắp xếp theo ngày tăng (cũ nhất trước)
+            matches.sort(key=lambda x: x[2] or "")
+            selected_indices = list(range(1, min(count, len(matches)) + 1))
+            res = mark_pages_by_indices(chat_id, kw, matches, selected_indices)
+
+            if res.get("succeeded"):
+                txt = "✅ Đã tự động tích:\n"
+                for pid, title, date_iso in res["succeeded"]:
+                    ds = date_iso[:10] if date_iso else "-"
+                    txt += f"{ds} — {title}\n"
+                send_long_text(chat_id, txt)
+            if res.get("failed"):
+                send_telegram(chat_id, f"⚠️ Có {len(res['failed'])} mục đánh dấu lỗi.")
+            checked, unchecked = count_checked_unchecked(kw)
+            send_telegram(chat_id, f"✅ Đã tích: {checked}\n🟡 Chưa tích: {unchecked}")
+            return
+
+        # --- UNDO ---
         if action == "undo":
             send_telegram(chat_id, "Đang tìm và undo...")
             threading.Thread(target=undo_last, args=(chat_id, 1), daemon=True).start()
             return
 
+        # --- ARCHIVE ---
         if action == "archive":
             kw = keyword
-            # interactive archive: list all matched pages and ask selection or 'all'
             matches = find_matching_all_pages_in_db(NOTION_DATABASE_ID, kw, limit=5000)
             checked, unchecked = count_checked_unchecked(kw)
-            header = f"🔎 : '{kw}'\n\n✅ Đã tích: {checked}\n\n🟡 Chưa tích: {unchecked}\n\n"
-            header += f"⚠️ CHÚ Ý: Bạn sắp archive {len(matches)} mục chứa '{kw}'.\n\nGửi số (ví dụ 1-7) trong {WAIT_CONFIRM}s để chọn, hoặc 'all' để archive tất cả, hoặc /cancel.\n\n"
+            header = f"🔎 '{kw}'\n\n✅ Đã tích: {checked}\n🟡 Chưa tích: {unchecked}\n\n"
+            header += f"⚠️ Bạn sắp archive {len(matches)} mục chứa '{kw}'. Gửi số (1-7), 'all' hoặc /cancel.\n\n"
             lines = []
             for i, (pid, title, date_iso) in enumerate(matches, start=1):
                 ds = date_iso[:10] if date_iso else "-"
@@ -826,6 +896,7 @@ def handle_incoming_message(chat_id: int, text: str):
             pending_confirm[str(chat_id)] = {"type": "archive_select", "keyword": kw, "matches": matches, "expires": time.time() + WAIT_CONFIRM}
             return
 
+        # --- ĐÁO ---
         if action == "dao":
             kw = keyword
             matches = find_target_matches(kw)
@@ -833,19 +904,18 @@ def handle_incoming_message(chat_id: int, text: str):
                 send_telegram(chat_id, f"⚠️ Không tìm thấy '{kw}' trong DB đáo.")
                 return
             if len(matches) > 1:
-                header = f"Tìm thấy {len(matches)} kết quả cho '{kw}'. Chọn index để tiếp tục hoặc gửi SĐT để match chính xác."
+                header = f"Tìm thấy {len(matches)} kết quả cho '{kw}'. Chọn index để tiếp tục."
                 lines = []
                 for i, (pid, title, props) in enumerate(matches, start=1):
                     dt = extract_prop_text(props, "Đáo/thối") or "-"
                     gday = extract_prop_text(props, "G ngày") or "-"
-                    nb = extract_prop_text(props, "ngày trước") or extract_prop_text(props, "# ngày trước") or "-"
+                    nb = extract_prop_text(props, "ngày trước") or "-"
                     prev = extract_prop_text(props, "trước") or "-"
                     lines.append(f"{i}. {title} — Đáo/thối: {dt} — G ngày: {gday} — # ngày trước: {nb} — trước: {prev}")
                 send_long_text(chat_id, header + "\n\n" + "\n".join(lines))
                 pending_confirm[str(chat_id)] = {"type": "dao_choose", "matches": matches, "expires": time.time() + WAIT_CONFIRM}
                 send_telegram(chat_id, f"📤 Gửi số (ví dụ 1 hoặc 1-3) trong {WAIT_CONFIRM}s để chọn, hoặc /cancel.")
                 return
-            # single match -> preview
             pid, title, props = matches[0]
             can, preview = dao_preview_text_from_props(title, props)
             send_long_text(chat_id, preview)
@@ -855,6 +925,24 @@ def handle_incoming_message(chat_id: int, text: str):
             else:
                 send_telegram(chat_id, f"⚠️ Không thể thực hiện đáo cho '{title}'. Vui lòng kiểm tra dữ liệu.")
             return
+
+        # --- INTERACTIVE MARK MODE ---
+        matches = find_calendar_matches(kw)
+        checked, unchecked = count_checked_unchecked(kw)
+        if not matches:
+            send_telegram(chat_id, f"Không tìm thấy mục nào chưa tích cho '{kw}'.")
+            return
+        header = f"🔎 '{kw}'\n\n✅ Đã tích: {checked}\n🟡 Chưa tích: {unchecked}\n\n📤 Gửi số (ví dụ 1 hoặc 1-3) hoặc /cancel.\n\n"
+        lines = []
+        for i, (pid, title, date_iso, props) in enumerate(matches, start=1):
+            ds = date_iso[:10] if date_iso else "-"
+            lines.append(f"{i}. [{ds}] {title}")
+        send_long_text(chat_id, header + "\n".join(lines))
+        pending_confirm[str(chat_id)] = {"type": "mark", "keyword": kw, "matches": matches, "expires": time.time() + WAIT_CONFIRM}
+
+    except Exception as e:
+        traceback.print_exc()
+        send_telegram(chat_id, f"❌ Lỗi xử lý: {e}")
 
         # default: mark flow
         kw = keyword
