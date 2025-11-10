@@ -825,7 +825,6 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
         lai_amt = parse_money_from_text(lai_text) or 0
         if LA_NOTION_DATABASE_ID and lai_amt > 0:
             send_telegram(chat_id, f"💸 Tiếp tục tạo Lãi cho {title}...")
-            relation_target_id = created[0].get("id", source_page_id) if created else source_page_id
             create_lai_page(chat_id, title, lai_amt, relation_target_id)
         else:
             send_telegram(chat_id, f"ℹ️ Không có giá trị Lãi hoặc chưa cấu hình LA_NOTION_DATABASE_ID. Bỏ qua tạo Lãi.")
