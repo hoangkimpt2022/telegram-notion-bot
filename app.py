@@ -1136,10 +1136,12 @@ def index():
 @app.route("/webhook", methods=["POST"])
 def telegram_webhook():
     try:
-        data = request.get_json(force=True)
-    except Exception:
-        return jsonify({"ok": False, "error": "invalid json"}), 400
+        data = request.get_json(force=True, silent=True) or {}
+    except Exception as e:
+        print("❌ JSON decode error:", e)
+        data = {}
 
+    # ✅ Kiểm tra có dữ liệu không
     if not data:
         return jsonify({"ok": False, "error": "no data"}), 400
 
@@ -1158,7 +1160,6 @@ def telegram_webhook():
             daemon=True
         ).start()
 
-    # ✅ Quan trọng: trả lại JSON để Telegram biết bot đã nhận
     return jsonify({"ok": True})
 
 def auto_ping_render():
