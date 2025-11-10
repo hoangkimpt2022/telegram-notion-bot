@@ -494,6 +494,10 @@ def mark_pages_by_indices(chat_id: str, keyword: str, matches: List[Tuple[str, s
 # 🧠 UNDO STACK HANDLER — lưu & hoàn tác hành động gần nhất
 # ======================================================
 
+# ======================================================
+# 🧠 UNDO STACK HANDLER — lưu & hoàn tác hành động gần nhất
+# ======================================================
+
 def load_last_undo_log(chat_id: str) -> Optional[Dict[str, Any]]:
     """
     Lấy log undo gần nhất của người dùng từ bộ nhớ tạm.
@@ -505,7 +509,6 @@ def load_last_undo_log(chat_id: str) -> Optional[Dict[str, Any]]:
         print(f"⚠️ load_last_undo_log error: {e}")
         return None
 
-
 def clear_undo_log(chat_id: str):
     """
     Xóa log undo sau khi hoàn tất hoàn tác.
@@ -516,7 +519,6 @@ def clear_undo_log(chat_id: str):
             del undo_stack[key]
     except Exception as e:
         print(f"⚠️ clear_undo_log error: {e}")
-
 
 def update_checkbox(page_id: str, value: bool) -> Tuple[bool, Any]:
     """
@@ -530,7 +532,6 @@ def update_checkbox(page_id: str, value: bool) -> Tuple[bool, Any]:
     except Exception as e:
         print(f"⚠️ update_checkbox error: {e}")
         return False, str(e)
-
 
 def mark_pages_by_indices(chat_id: str, keyword: str, matches: List[Tuple[str, str, Optional[str], Dict[str, Any]]], indices: List[int]) -> Dict[str, Any]:
     """
@@ -618,7 +619,6 @@ def undo_last(chat_id: str, count: int = 1):
         final_text = f"✅ Hoàn tất hoàn tác {undone}/{total} mục"
         if failed:
             final_text += f" (⚠️ lỗi {failed} mục)"
-
         if message_id:
             edit_telegram_message(chat_id, message_id, final_text + " 🎉")
         else:
@@ -626,7 +626,6 @@ def undo_last(chat_id: str, count: int = 1):
 
         clear_undo_log(chat_id)
         return
-
     send_telegram(chat_id, "⚠️ Không tìm thấy hành động mark trong log undo.")
 
 # ------------- ACTIONS: archive -------------
