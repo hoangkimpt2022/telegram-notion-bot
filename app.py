@@ -281,20 +281,19 @@ def find_target_matches(keyword: str, db_id: str = TARGET_NOTION_DATABASE_ID) ->
     Tìm chính xác các page trong TARGET DB có tên trùng khớp hoàn toàn với keyword (không phân biệt hoa/thường hoặc dấu tiếng Việt).
     Ví dụ: "hương" chỉ match "Hương", KHÔNG match "Hương 13" hoặc "Hương VIP".
     """
+    pages = []     # ✅ tránh lỗi pages chưa có giá trị
+    matches = []   # ✅ tránh lỗi matches chưa có giá trị
+
     if not db_id:
         return []
 
-    # Chuẩn hóa keyword (bỏ dấu, viết thường, bỏ khoảng trắng dư)
     kw = normalize_text(keyword).strip()
     pages = query_database_all(db_id, page_size=MAX_QUERY_PAGE_SIZE)
-    matches = []
 
     for p in pages:
         props = p.get("properties", {})
         title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
         title_clean = normalize_text(title).strip()
-
-        # ✅ So khớp tuyệt đối tên (không phân biệt hoa/thường/dấu)
         if title_clean == kw:
             matches.append((p.get("id"), title, props))
 
