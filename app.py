@@ -661,7 +661,7 @@ def handle_command_archive(chat_id: str, keyword: str, auto_confirm_all: bool = 
     If called interactively, use the handler in handle_incoming_message to present options.
     """
     try:
-        matches = find_matching_all_pages_in_db(NOTION_DATABASE_ID, keyword, limit=5000)
+        matches = find_matching_all_pages_in_db(NOTION_DATABASE_ID, keyword, limit=500)
         total = len(matches)
         send_telegram(chat_id, f"🧹 Đang xóa {total} ngày của {keyword} (check + uncheck)...")
         if total == 0:
@@ -687,7 +687,7 @@ def handle_command_archive(chat_id: str, keyword: str, auto_confirm_all: bool = 
         return {"ok": False, "error": str(e)}
 
 # ------------- ACTIONS: create lai page -------------
-def create_lai_page(chat_id: int, title: str, lai_amount: float, target_page_id: str):
+def create_lai_page(chat_id: int, title: str, lai_amount: float, source_page_id: str):
     """
     Tạo 1 page Lãi trong LA_NOTION_DATABASE_ID với:
      - Name = title
@@ -699,9 +699,8 @@ def create_lai_page(chat_id: int, title: str, lai_amount: float, target_page_id:
         if not LA_NOTION_DATABASE_ID:
             send_telegram(chat_id, "⚠️ Chưa cấu hình LA_NOTION_DATABASE_ID.")
             return
-
-        if not target_page_id:
-            send_telegram(chat_id, "⚠️ Không có target_page_id để liên kết.")
+        if not source_page_id:
+            send_telegram(chat_id, "⚠️ Không có source_page_id để liên kết.")
             return
 
         today = datetime.now().date().isoformat()
@@ -710,7 +709,7 @@ def create_lai_page(chat_id: int, title: str, lai_amount: float, target_page_id:
             "Name": {"title": [{"type": "text", "text": {"content": title}}]},
             "Lai": {"number": float(lai_amount) if lai_amount else 0.0},
             "ngày lai": {"date": {"start": today}},
-            "Lịch G": {"relation": [{"id": target_page_id}]}  # ✅ trỏ về TARGET_NOTION_DATABASE_ID
+            "Lịch G": {"relation": [{"id": source_page_id}]}  # ✅ trỏ về TARGET_NOTION_DATABASE_ID
         }
 
         url = "https://api.notion.com/v1/pages"
