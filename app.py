@@ -490,6 +490,83 @@ def mark_pages_by_indices(chat_id: str, keyword: str, matches: List[Tuple[str, s
             failed.append((pid, str(e)))
     return {"ok": len(failed) == 0, "succeeded": succeeded, "failed": failed}
 
+# ======================================================
+# 🧠 UNDO STACK HANDLER — lưu & hoàn tác hành động gần nhất
+# ======================================================
+
+def load_last_undo_log(chat_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Lấy log undo gần nhất của người dùng từ bộ nhớ tạm.
+    """
+    try:
+        key = str(chat_id)
+        return undo_stack.get(key)
+    except Exception as e:
+        print(f"⚠️ load_last_undo_log error: {e}")
+        return None
+
+
+def clear_undo_log(chat_id: str):
+    """
+    Xóa log undo sau khi hoàn tất hoàn tác.
+    """
+    try:
+        key = str(chat_id)
+        if key in undo_stack:
+            del undo_stack[key]
+    except Exception as e:
+        print(f"⚠️ clear_undo_log error: {e}")
+
+
+def update_checkbox(page_id: str, value: bool) -> Tuple[bool, Any]:
+    """
+    Cập nhật trạng thái checkbox 'Đã Góp' cho 1 page Notion.
+    Dùng cho undo: bỏ check lại (False) hoặc tích lại (True).
+    """
+    try:
+        cb_prop = {"Đã Góp": {"checkbox": bool(value)}}
+        ok, res = update_page_properties(page_id, cb_prop)
+        return ok, res
+    except Exception as e:
+        print(f"⚠️ update_checkbox error: {e}")
+        return False, str(e)
+
+
+def mark_pages_by_indices(chat_id: str, keyword: str, matches: List[Tuple[str, str, Optional[str], Dict[str, Any]]], indices: List[int]) -> Dict[str, Any]:
+    """
+    Đánh dấu page theo index, đồng thời ghi log undo để hoàn tác.
+    """
+    succeeded = []
+    failed = []
+    if len(indices) == 1 and indices[0] > 1:
+        n = indices[0]
+        indices = list(range(1, min(n, len(matches)) + 1))
+
+    for idx in indices:
+        if idx < 1 or idx > len(matches):
+            failed.append((idx, "index out of range"))
+            continue
+        pid, title, date_iso, props = matches[idx - 1]
+        try:
+            cb_key = find_prop_key(props, "Đã Góp") or find_prop_key(props, "Sent") or find_prop_key(props, "Status")
+            update_props = {cb_key or "Đã Góp": {"checkbox": True}}
+            ok, res = update_page_properties(pid, update_props)
+            if ok:
+                succeeded.append((pid, title, date_iso))
+            else:
+                failed.append((pid, res))
+        except Exception as e:
+            failed.append((pid, str(e)))
+
+    # ✅ Ghi log undo (để có thể hoàn tác sau này)
+    if succeeded:
+        undo_stack[str(chat_id)] = {
+            "action": "mark",
+            "pages": [pid for pid, _, _ in succeeded]
+        }
+
+    return {"ok": len(failed) == 0, "succeeded": succeeded, "failed": failed}
+
 def undo_last(chat_id: str, count: int = 1):
     """
     Hoàn tác hành động cuối cùng (undo), ví dụ: bỏ check nhiều ngày vừa tích.
