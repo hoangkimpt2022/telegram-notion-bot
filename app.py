@@ -619,26 +619,33 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
         all_pages = query_database_all(NOTION_DATABASE_ID, page_size=500)
         kw = title.strip().lower()
         matched = []
+
         for p in all_pages:
             props_p = p.get("properties", {})
             name_p = extract_prop_text(props_p, "Name") or ""
             if kw in name_p.lower():
-                matched.append(p.get("id"))
+                matched.append((p.get("id"), name_p))  # ✅ lưu cả id và tên để log
+
         # --- 🧹 XÓA TOÀN BỘ NGÀY CŨ (CÓ BAR ANIMATION) ---
-        total = len(matches)
-        msg = send_telegram(chat_id, f"🧹 Đang xóa {total} ngày của {title} (check + uncheck)...")
-        message_id = msg.get("result", {}).get("message_id")
-        for idx, (pid, title_page, date_iso) in enumerate(matches, start=1):
-            try:
-                archive_page(pid)
-                bar = int((idx / total) * 10)
-                progress = "█" * bar + "░" * (10 - bar)
-                new_text = f"🧹 Xóa {idx}/{total} [{progress}]"
-                edit_telegram_message(chat_id, message_id, new_text)
-                time.sleep(0.4)
-            except Exception as e:
-                print(f"Lỗi khi xóa {title_page}: {e}")
-        edit_telegram_message(chat_id, message_id, f"✅ Đã xóa xong {total} mục của {title}! 🎉")
+        total = len(matched)
+        if total == 0:
+            send_telegram(chat_id, f"✅ Không có ngày cũ nào để xóa cho {title}.")
+        else:
+            msg = send_telegram(chat_id, f"🧹 Đang xóa {total} ngày của {title} (check + uncheck)...")
+            message_id = msg.get("result", {}).get("message_id")
+
+            for idx, (pid, title_page) in enumerate(matched, start=1):
+                try:
+                    archive_page(pid)
+                    bar = int((idx / total) * 10)
+                    progress = "█" * bar + "░" * (10 - bar)
+                    new_text = f"🧹 Xóa {idx}/{total} [{progress}]"
+                    edit_telegram_message(chat_id, message_id, new_text)
+                    time.sleep(0.4)
+                except Exception as e:
+                    print(f"⚠️ Lỗi khi xóa {title_page}: {e}")
+
+            edit_telegram_message(chat_id, message_id, f"✅ Đã xóa xong {total} mục của {title}! 🎉")
 
         # --- 2️⃣ TẠO PAGE MỚI ---
         from datetime import timezone
