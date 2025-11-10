@@ -300,45 +300,60 @@ def find_target_matches(keyword: str, db_id: str = TARGET_NOTION_DATABASE_ID) ->
     return matches
 
 def find_calendar_matches(keyword: str) -> List[Tuple[str, str, Optional[str], Dict[str, Any]]]:
-    """Return unchecked pages in NOTION_DATABASE_ID matching keyword; sorted by date asc."""
+    """
+    Trả về danh sách các page chưa tích trong NOTION_DATABASE_ID khớp với keyword.
+    Sắp xếp tăng dần theo ngày Góp.
+    """
+    # 🧱 Kiểm tra cấu hình Notion
     if not NOTION_DATABASE_ID:
+        print("⚠️ Lỗi: NOTION_DATABASE_ID chưa được cấu hình.")
         return []
-        kw = normalize_text(keyword)
-        pages = query_database_all(NOTION_DATABASE_ID, page_size=MAX_QUERY_PAGE_SIZE)
-        matches: List[Tuple[str, str, Optional[str], Dict[str, Any]]] = []
 
+    # 🔧 Khởi tạo biến an toàn
+    kw = normalize_text(keyword)
+    matches: List[Tuple[str, str, Optional[str], Dict[str, Any]]] = []
+    pages = query_database_all(NOTION_DATABASE_ID, page_size=MAX_QUERY_PAGE_SIZE)
+
+    # 🧾 Duyệt từng page trong database
     for p in pages:
         props = p.get("properties", {})
         title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
         title_clean = normalize_text(title)
         kw_clean = normalize_text(kw)
-        date_iso = None  # ✅ khởi tạo tránh lỗi "cannot access local variable"
+        date_iso = None   # ✅ tránh lỗi "local variable referenced before assignment"
+        score = 0
 
-        # ---- MATCH LOGIC ----
+        # ---- LOGIC KHỚP TÊN ----
         if title_clean == kw_clean or title_clean.strip() == kw_clean:
             score = 2
         else:
             continue
 
-        # ---- CHECKBOX ----
-        cb_key = find_prop_key(props, "Đã Góp") or find_prop_key(props, "ĐãGóp") or find_prop_key(props, "Sent") or find_prop_key(props, "Status")
+        # ---- KIỂM TRA CHECKBOX (bỏ qua nếu đã tích) ----
+        cb_key = (
+            find_prop_key(props, "Đã Góp")
+            or find_prop_key(props, "ĐãGóp")
+            or find_prop_key(props, "Sent")
+            or find_prop_key(props, "Status")
+        )
         checked = False
         if cb_key and props.get(cb_key, {}).get("type") == "checkbox":
             checked = bool(props.get(cb_key, {}).get("checkbox"))
         if checked:
-            continue  # bỏ qua những mục đã tích
+            continue  # ⚠️ bỏ qua những mục đã tích
 
         # ---- NGÀY GÓP ----
         date_key = find_prop_key(props, "Ngày Góp")
         if date_key:
             date_field = props.get(date_key, {})
-            if date_field.get("type") == "date":
+            if date_field.get("type") == "date" and date_field.get("date"):
                 date_iso = date_field["date"].get("start")
 
+        # 🧩 Ghi vào danh sách kết quả
         matches.append((p.get("id"), title, date_iso, props))
 
-    # ---- SẮP XẾP: Ưu tiên score cao, sau đó theo ngày ----
-    matches.sort(key=lambda x: (-score, x[2] or ""))
+    # 🧮 Sắp xếp: theo ngày tăng dần (ưu tiên ngày có giá trị)
+    matches.sort(key=lambda x: (x[2] is None, x[2] or ""))
     return matches
 
 def find_matching_all_pages_in_db(database_id: str, keyword: str, limit: int = 2000) -> List[Tuple[str, str, Optional[str]]]:
@@ -786,44 +801,137 @@ def process_pending_selection_for_dao(chat_id: str, raw: str):
             del pending_confirm[key]
 
 def process_pending_selection(chat_id: str, raw: str):
+    """
+    Xử lý các lựa chọn đang chờ xác nhận (MARK / ARCHIVE).
+    Có hiển thị progress bar và emoji sinh động để báo tiến trình.
+    """
     key = str(chat_id)
     data = pending_confirm.get(key)
+
     if not data:
-        send_telegram(chat_id, "Không có thao tác đang chờ.")
+        send_telegram(chat_id, "❌ Không có thao tác nào đang chờ.")
         return
+
     try:
-        if raw.strip().lower() in ("/cancel", "cancel", "hủy", "huy"):
+        raw_input = raw.strip().lower()
+
+        # 🛑 HỦY thao tác nếu người dùng gõ /cancel
+        if raw_input in ("/cancel", "cancel", "hủy", "huỷ", "huy"):
             del pending_confirm[key]
-            send_telegram(chat_id, "Đã hủy thao tác đang chờ.")
+            send_telegram(chat_id, "🛑 Đã hủy thao tác đang chờ.")
             return
+
         matches = data.get("matches", [])
-        indices = parse_user_selection_text(raw, len(matches))
-        if not indices:
-            send_telegram(chat_id, "Không nhận được lựa chọn hợp lệ.")
+        if not matches:
+            send_telegram(chat_id, "⚠️ Không tìm thấy danh sách mục đang xử lý.")
+            del pending_confirm[key]
             return
+
+        indices = parse_user_selection_text(raw_input, len(matches))
+        if not indices:
+            send_telegram(chat_id, "⚠️ Không nhận được lựa chọn hợp lệ.")
+            return
+
         action = data.get("type")
+
+        # ======================================================
+        # 🧹 ARCHIVE MODE — XÓA PAGE CÓ THANH BAR
+        # ======================================================
+        if action == "archive_select":
+            selected = [matches[i - 1] for i in indices if 1 <= i <= len(matches)]
+            total_sel = len(selected)
+            if total_sel == 0:
+                send_telegram(chat_id, "⚠️ Không có mục nào được chọn để xóa.")
+                del pending_confirm[key]
+                return
+
+            msg = send_telegram(chat_id, f"🧹 Bắt đầu xóa {total_sel} mục của '{data['keyword']}' ...")
+            message_id = msg.get("result", {}).get("message_id")
+
+            for idx, (pid, title, date_iso, props) in enumerate(selected, start=1):
+                try:
+                    ok, res = archive_page(pid)
+                    if not ok:
+                        send_telegram(chat_id, f"⚠️ Lỗi khi xóa {title}: {res}")
+                        continue
+
+                    # 🔄 Thanh tiến trình (10 khối)
+                    bar = int((idx / total_sel) * 10)
+                    progress = "█" * bar + "░" * (10 - bar)
+                    percent = int((idx / total_sel) * 100)
+                    new_text = f"🧹 Xóa {idx}/{total_sel} [{progress}] {percent}%"
+                    edit_telegram_message(chat_id, message_id, new_text)
+
+                    time.sleep(0.4)
+                except Exception as e:
+                    send_telegram(chat_id, f"⚠️ Lỗi khi xóa {idx}/{total_sel}: {e}")
+
+            # ✅ Kết thúc
+            edit_telegram_message(
+                chat_id,
+                message_id,
+                f"✅ Hoàn tất xóa {total_sel}/{total_sel} mục của '{data['keyword']}' 🎉"
+            )
+            del pending_confirm[key]
+            return
+
+        # ======================================================
+        # ✅ MARK MODE — ĐÁNH DẤU (CHECK) CÁC MỤC CHỌN
+        # ======================================================
         if action == "mark":
             keyword = data.get("keyword")
-            res = mark_pages_by_indices(chat_id, keyword, matches, indices)
-            if res.get("succeeded"):
-                txt = "✅ Đã đánh dấu:\n"
-                for pid, title, date_iso in res["succeeded"]:
-                    ds = date_iso[:10] if date_iso else "-"
-                    txt += f"{ds} — {title}\n"
-                send_long_text(chat_id, txt)
-            if res.get("failed"):
-                send_telegram(chat_id, f"⚠️ Lỗi khi đánh dấu: {res['failed']}")
-            checked, unchecked = count_checked_unchecked(keyword)
-            send_telegram(chat_id, f"✅ Đã tích: {checked}\n\n🟡 Chưa tích: {unchecked}")
-            del pending_confirm[key]
-            return
-        if action == "archive_select":
+            total_sel = len(indices)
+            msg = send_telegram(chat_id, f"🟢 Bắt đầu đánh dấu {total_sel} mục cho '{keyword}' ...")
+            message_id = msg.get("result", {}).get("message_id")
+
+            succeeded, failed = [], []
+
             for idx in indices:
                 if 1 <= idx <= len(matches):
-                    pid, title, date_iso = matches[idx - 1]
-                    handle_command_archive(chat_id, title)
+                    pid, title, date_iso, props = matches[idx - 1]
+                    try:
+                        cb_key = (
+                            find_prop_key(props, "Đã Góp")
+                            or find_prop_key(props, "Sent")
+                            or find_prop_key(props, "Status")
+                        )
+                        update_props = {cb_key or "Đã Góp": {"checkbox": True}}
+                        ok, res = update_page_properties(pid, update_props)
+                        if ok:
+                            succeeded.append((pid, title))
+
+                            # 🔄 Thanh tiến trình
+                            bar = int((len(succeeded) / total_sel) * 10)
+                            progress = "█" * bar + "░" * (10 - bar)
+                            percent = int((len(succeeded) / total_sel) * 100)
+                            new_text = f"🟢 Đánh dấu {len(succeeded)}/{total_sel} [{progress}] {percent}%"
+                            edit_telegram_message(chat_id, message_id, new_text)
+                        else:
+                            failed.append((pid, res))
+                    except Exception as e:
+                        failed.append((pid, str(e)))
+                    time.sleep(0.3)
+
+            # ✅ Kết quả cuối cùng
+            result_text = f"✅ Hoàn tất đánh dấu {len(succeeded)}/{total_sel} mục 🎉"
+            if failed:
+                result_text += f"\n⚠️ Lỗi: {len(failed)} mục không thể cập nhật."
+            edit_telegram_message(chat_id, message_id, result_text)
+
+            # 📊 Thống kê sau khi mark
+            checked, unchecked = count_checked_unchecked(keyword)
+            send_telegram(chat_id, f"📊 Đã tích: {checked}\n🟡 Chưa tích: {unchecked}")
+
             del pending_confirm[key]
             return
+
+        # ======================================================
+        # ❓ Nếu không xác định được loại action
+        # ======================================================
+        send_telegram(chat_id, "⚠️ Không xác định được loại thao tác. Vui lòng thử lại.")
+        del pending_confirm[key]
+        return
+
     except Exception as e:
         traceback.print_exc()
         send_telegram(chat_id, f"❌ Lỗi xử lý lựa chọn: {e}")
