@@ -692,7 +692,7 @@ def create_lai_page(chat_id: int, title: str, lai_amount: float, target_page_id:
     Tạo 1 page Lãi trong LA_NOTION_DATABASE_ID với:
      - Name = title
      - Lai = số tiền lãi
-     - Ngày Lãi = hôm nay
+     - ngày lai = hôm nay
      - Lịch G = relation trỏ về page gốc trong TARGET_NOTION_DATABASE_ID
     """
     try:
@@ -709,7 +709,7 @@ def create_lai_page(chat_id: int, title: str, lai_amount: float, target_page_id:
         props_payload = {
             "Name": {"title": [{"type": "text", "text": {"content": title}}]},
             "Lai": {"number": float(lai_amount) if lai_amount else 0.0},
-            "Ngày Lãi": {"date": {"start": today}},
+            "ngày lai": {"date": {"start": today}},
             "Lịch G": {"relation": [{"id": target_page_id}]}  # ✅ trỏ về TARGET_NOTION_DATABASE_ID
         }
 
@@ -965,6 +965,11 @@ def process_pending_selection(chat_id: str, raw: str):
         if action == "archive_select":
             selected = [matches[i - 1] for i in indices if 1 <= i <= len(matches)]
             total_sel = len(selected)
+            # ✅ Ghi log undo cho hành động xóa
+            undo_stack[str(chat_id)] = {
+                "action": "archive",
+                "pages": [pid for pid, _, _, _ in selected]
+            }
             if total_sel == 0:
                 send_telegram(chat_id, "⚠️ Không có mục nào được chọn để xóa.")
                 del pending_confirm[key]
