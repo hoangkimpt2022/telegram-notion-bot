@@ -490,41 +490,22 @@ def mark_pages_by_indices(chat_id: str, keyword: str, matches: List[Tuple[str, s
             failed.append((pid, str(e)))
     return {"ok": len(failed) == 0, "succeeded": succeeded, "failed": failed}
 
-# ======================================================
-# 🧠 UNDO STACK HANDLER — lưu & hoàn tác hành động gần nhất
-# ======================================================
-
-# ======================================================
-# 🧠 UNDO STACK HANDLER — lưu & hoàn tác hành động gần nhất
+# 🧠 UNDO SYSTEM — Lưu & Hoàn tác hành động đánh dấu
 # ======================================================
 
 def load_last_undo_log(chat_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Lấy log undo gần nhất của người dùng từ bộ nhớ tạm.
-    """
-    try:
-        key = str(chat_id)
-        return undo_stack.get(key)
-    except Exception as e:
-        print(f"⚠️ load_last_undo_log error: {e}")
-        return None
+    """Lấy log undo gần nhất trong bộ nhớ tạm."""
+    key = str(chat_id)
+    return undo_stack.get(key)
 
 def clear_undo_log(chat_id: str):
-    """
-    Xóa log undo sau khi hoàn tất hoàn tác.
-    """
-    try:
-        key = str(chat_id)
-        if key in undo_stack:
-            del undo_stack[key]
-    except Exception as e:
-        print(f"⚠️ clear_undo_log error: {e}")
+    """Xóa log undo sau khi hoàn tất."""
+    key = str(chat_id)
+    if key in undo_stack:
+        del undo_stack[key]
 
 def update_checkbox(page_id: str, value: bool) -> Tuple[bool, Any]:
-    """
-    Cập nhật trạng thái checkbox 'Đã Góp' cho 1 page Notion.
-    Dùng cho undo: bỏ check lại (False) hoặc tích lại (True).
-    """
+    """Cập nhật trạng thái checkbox 'Đã Góp' của 1 page Notion."""
     try:
         cb_prop = {"Đã Góp": {"checkbox": bool(value)}}
         ok, res = update_page_properties(page_id, cb_prop)
@@ -533,12 +514,18 @@ def update_checkbox(page_id: str, value: bool) -> Tuple[bool, Any]:
         print(f"⚠️ update_checkbox error: {e}")
         return False, str(e)
 
-def mark_pages_by_indices(chat_id: str, keyword: str, matches: List[Tuple[str, str, Optional[str], Dict[str, Any]]], indices: List[int]) -> Dict[str, Any]:
+
+def mark_pages_by_indices(chat_id: str, keyword: str,
+                          matches: List[Tuple[str, str, Optional[str], Dict[str, Any]]],
+                          indices: List[int]) -> Dict[str, Any]:
     """
-    Đánh dấu page theo index, đồng thời ghi log undo để hoàn tác.
+    Đánh dấu page theo index, đồng thời ghi log undo để có thể hoàn tác.
+    - Nếu user nhập 1 số (vd: 5) => đánh dấu từ 1..5 (oldest first).
     """
     succeeded = []
     failed = []
+
+    # Xử lý auto-expand "gam 3" -> đánh dấu 3 mục đầu
     if len(indices) == 1 and indices[0] > 1:
         n = indices[0]
         indices = list(range(1, min(n, len(matches)) + 1))
@@ -547,6 +534,7 @@ def mark_pages_by_indices(chat_id: str, keyword: str, matches: List[Tuple[str, s
         if idx < 1 or idx > len(matches):
             failed.append((idx, "index out of range"))
             continue
+
         pid, title, date_iso, props = matches[idx - 1]
         try:
             cb_key = find_prop_key(props, "Đã Góp") or find_prop_key(props, "Sent") or find_prop_key(props, "Status")
@@ -559,7 +547,7 @@ def mark_pages_by_indices(chat_id: str, keyword: str, matches: List[Tuple[str, s
         except Exception as e:
             failed.append((pid, str(e)))
 
-    # ✅ Ghi log undo (để có thể hoàn tác sau này)
+    # ✅ Ghi log undo (chỉ khi có page thành công)
     if succeeded:
         undo_stack[str(chat_id)] = {
             "action": "mark",
@@ -568,65 +556,102 @@ def mark_pages_by_indices(chat_id: str, keyword: str, matches: List[Tuple[str, s
 
     return {"ok": len(failed) == 0, "succeeded": succeeded, "failed": failed}
 
+
 def undo_last(chat_id: str, count: int = 1):
     """
-    Hoàn tác hành động cuối cùng (undo), ví dụ: bỏ check nhiều ngày vừa tích.
-    Có thanh tiến trình và emoji hiển thị động.
+    Hoàn tác hành động gần nhất (undo):
+      - mark → bỏ check lại
+      - archive → khôi phục page (nếu có log)
+    Có progress bar + emoji động trong Telegram.
     """
     log = load_last_undo_log(chat_id)
     if not log:
         send_telegram(chat_id, "❌ Không có hành động nào để hoàn tác.")
         return
 
-    if log.get("action") == "mark":
-        pages = log.get("pages", [])
-        total = len(pages)
-        if total == 0:
-            send_telegram(chat_id, "⚠️ Không tìm thấy danh sách page trong log undo.")
-            return
+    action = log.get("action")
+    pages = log.get("pages", [])
 
-        # Gửi message ban đầu
+    if not pages:
+        send_telegram(chat_id, "⚠️ Không tìm thấy danh sách page trong log undo.")
+        return
+
+    total = len(pages)
+
+    if action == "mark":
         msg = send_telegram(chat_id, f"♻️ Đang hoàn tác {total} ngày vừa tích...")
         message_id = msg.get("result", {}).get("message_id") if msg.get("ok") else None
 
         undone = 0
         failed = 0
-
         for idx, pid in enumerate(pages, start=1):
             try:
-                ok, res = update_checkbox(pid, False)
+                ok, _ = update_checkbox(pid, False)
                 if ok:
                     undone += 1
                 else:
                     failed += 1
 
-                # 🔄 Thanh tiến trình
+                # Thanh bar tiến trình + emoji xoay
                 bar = int((idx / total) * 10)
                 progress = "█" * bar + "░" * (10 - bar)
                 icon = ["♻️", "🔄", "💫", "✨"][idx % 4]
                 new_text = f"{icon} Hoàn tác {idx}/{total} [{progress}]"
-
-                # Chỉ update nếu có message_id
                 if message_id:
                     edit_telegram_message(chat_id, message_id, new_text)
-
                 time.sleep(0.4)
             except Exception as e:
-                print("Undo lỗi:", e)
+                print(f"Undo lỗi: {e}")
                 failed += 1
 
         # ✅ Kết quả cuối cùng
-        final_text = f"✅ Hoàn tất hoàn tác {undone}/{total} mục"
+        final_text = f"✅ Hoàn tất hoàn tác {undone}/{total} mục 🎉"
         if failed:
             final_text += f" (⚠️ lỗi {failed} mục)"
         if message_id:
-            edit_telegram_message(chat_id, message_id, final_text + " 🎉")
+            edit_telegram_message(chat_id, message_id, final_text)
         else:
-            send_telegram(chat_id, final_text + " 🎉")
-
+            send_telegram(chat_id, final_text)
         clear_undo_log(chat_id)
         return
-    send_telegram(chat_id, "⚠️ Không tìm thấy hành động mark trong log undo.")
+
+    elif action == "archive":
+        msg = send_telegram(chat_id, f"🗃️ Đang khôi phục {total} page đã xóa ...")
+        message_id = msg.get("result", {}).get("message_id") if msg.get("ok") else None
+
+        restored = 0
+        failed = 0
+        for idx, pid in enumerate(pages, start=1):
+            try:
+                ok, _ = restore_page(pid)  # ✅ gọi hàm unarchive
+                if ok:
+                    restored += 1
+                else:
+                    failed += 1
+
+                bar = int((idx / total) * 10)
+                progress = "█" * bar + "░" * (10 - bar)
+                icon = ["♻️", "🔄", "💫", "✨"][idx % 4]
+                new_text = f"{icon} Khôi phục {idx}/{total} [{progress}]"
+                if message_id:
+                    edit_telegram_message(chat_id, message_id, new_text)
+                time.sleep(0.4)
+            except Exception as e:
+                print(f"Undo archive lỗi: {e}")
+                failed += 1
+
+        final_text = f"✅ Đã khôi phục {restored}/{total} page 🎉"
+        if failed:
+            final_text += f" (⚠️ lỗi {failed} page)"
+        if message_id:
+            edit_telegram_message(chat_id, message_id, final_text)
+        else:
+            send_telegram(chat_id, final_text)
+        clear_undo_log(chat_id)
+        return
+
+    else:
+        send_telegram(chat_id, "⚠️ Loại hành động chưa được hỗ trợ hoàn tác.")
 
 # ------------- ACTIONS: archive -------------
 def handle_command_archive(chat_id: str, keyword: str, auto_confirm_all: bool = True) -> Dict[str, Any]:
