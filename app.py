@@ -60,6 +60,31 @@ def edit_telegram_message(chat_id, message_id, new_text):
     payload = {"chat_id": chat_id, "message_id": message_id, "text": new_text}
     requests.post(url, json=payload, timeout=10)
 
+def start_waiting_animation(chat_id: int, message_id: int, duration: int = 120, interval: float = 2.0):
+    """
+    Hiển thị emoji động trong suốt thời gian chờ confirm (ví dụ 120s).
+    """
+    def animate():
+        start_time = time.time()
+        emojis = ["🔄", "💫", "✨", "🌙", "🕒", "⏳"]
+        idx = 0
+        while time.time() - start_time < duration:
+            try:
+                text = f"{emojis[idx % len(emojis)]} Đang chờ phản hồi... ({int(time.time() - start_time)}s/{duration}s)"
+                edit_telegram_message(chat_id, message_id, text)
+                time.sleep(interval)
+                idx += 1
+            except Exception as e:
+                print("⚠️ animation error:", e)
+                break
+        # khi hết 120s thì cập nhật thông báo hết hạn
+        try:
+            edit_telegram_message(chat_id, message_id, "⏳ Thao tác chờ đã hết hạn.")
+        except Exception as e:
+            print("⚠️ lỗi khi gửi thông báo hết hạn:", e)
+
+    threading.Thread(target=animate, daemon=True).start()
+   
 def send_long_text(chat_id: str, text: str):
     """Chunk long text for Telegram."""
     max_len = 3000
@@ -394,16 +419,16 @@ def dao_preview_text_from_props(title: str, props: Dict[str, Any]) -> Tuple[bool
 
         # --- Trường hợp 1: emoji 🔴 -> chưa thể đáo ---
         if "🔴" in dao_text:
-            return False, f"🔔 đáo lại cho: {title} - Tổng đáo: 🔴 {int(total_val)}\n\nchưa thể đáo ."
+            return False, f"🔔 đáo lại cho: {title} - Tổng CK: 🔴 {int(total_val)}\n\nchưa thể đáo ."
 
         # --- Trường hợp 2: emoji ✅ ---
         if "✅" in dao_text:
             # Nếu không có "ngày trước" hoặc = 0 → chỉ tạo Lãi
             if not days_before or days_before <= 0:
                 msg = (
-                    f"🔔 đáo lại cho: {title} - Tổng đáo: ✅ {int(total_val)}\n\n"
-                    f"Không Lấy trước\n"
-                    f" /ok ,  /cancel ."
+                    f"🔔 đáo lại cho: {title} - Tổng CK: ✅  {int(total_val)}\n\n"
+                    f"💴 Không Lấy trước\n"
+                    f" 📆 Bắt đầu góp lại từ ngày mai"
                 )
                 # cho phép /ok nhưng đánh dấu rằng chỉ tạo Lãi
                 props["ONLY_LAI"] = True
@@ -417,7 +442,7 @@ def dao_preview_text_from_props(title: str, props: Dict[str, Any]) -> Tuple[bool
 
             lines = [
                 f"🔔 Đáo lại cho: {title} - Tổng CK: ✅ {int(total_val)}",
-                f"Lấy trước: {take_days} ngày {int(per_day)} là {total_pre} \n (bắt đầu từ ngày mai):",]           
+                f"💴 Lấy trước: {take_days} ngày {int(per_day)} là {total_pre} \n  📆(bắt đầu từ ngày mai):",]           
             for idx, d in enumerate(date_list, start=1):
                 lines.append(f"{idx}. {d}")          
             return True, "\n".join(lines)
@@ -1048,7 +1073,7 @@ def process_pending_selection(chat_id: str, raw: str):
 
             # 📊 Thống kê sau khi mark
             checked, unchecked = count_checked_unchecked(keyword)
-            send_telegram(chat_id, f"📊 Đã tích: {checked}\n🟡 Chưa tích: {unchecked}")
+            send_telegram(chat_id, f"📊 Đã góp: {checked}\n🛑 Chưa góp: {unchecked}")
 
             del pending_confirm[key]
             return
@@ -1160,7 +1185,7 @@ def handle_incoming_message(chat_id: int, text: str):
 
         # --- AUTO-MARK MODE ---
         if action == "mark" and count > 0:
-            send_telegram(chat_id, f"🔍 Đang xử lý tìm '{kw}' ... 🔄")
+            send_telegram(chat_id, f" 🎏 Đang auto tích 🔄... {kw} ")
             matches = find_calendar_matches(kw)
             if not matches:
                 send_telegram(chat_id, f"Không tìm thấy mục nào cho '{kw}'.")
@@ -1172,7 +1197,7 @@ def handle_incoming_message(chat_id: int, text: str):
             res = mark_pages_by_indices(chat_id, kw, matches, selected_indices)
 
             if res.get("succeeded"):
-                txt = "✅ Đã tự động tích:\n"
+                txt = "✅ ngày mới góp 📆:\n"
                 for pid, title, date_iso in res["succeeded"]:
                     ds = date_iso[:10] if date_iso else "-"
                     txt += f"{ds} — {title}\n"
@@ -1182,7 +1207,7 @@ def handle_incoming_message(chat_id: int, text: str):
                 send_telegram(chat_id, f"⚠️ Có {len(res['failed'])} mục đánh dấu lỗi.")
 
             checked, unchecked = count_checked_unchecked(kw)
-            send_telegram(chat_id, f"✅ Đã tích: {checked}\n🟡 Chưa tích: {unchecked}")
+            send_telegram(chat_id, f"✅ Đã góp: {checked}\n🛑 Chưa góp: {unchecked}")
             return
 
         # --- UNDO ---
@@ -1280,33 +1305,38 @@ def handle_incoming_message(chat_id: int, text: str):
                 }
                 send_telegram(
                     chat_id, 
-                    f"✅ Có thể đáo cho '{title}'. Gõ /ok để thực hiện trong {WAIT_CONFIRM}s hoặc /cancel để hủy."
+                    f"✅ Có thể đáo cho '{title}'. /ok trong {WAIT_CONFIRM}s /cancel ."
                 )
+                # ✅ Hiển thị thông báo chờ và khởi động animation
+                msg = send_telegram(chat_id, "⏳ Đang chờ phản hồi... 🔄")
+                message_id = msg.get("result", {}).get("message_id")
+                if message_id:
+                    start_waiting_animation(chat_id, message_id, duration=int(WAIT_CONFIRM))
             else:
-                send_telegram(chat_id, f"⚠️ Không thể thực hiện đáo cho '{title}'. Vui lòng kiểm tra dữ liệu.")
+                send_telegram(chat_id, f"⚠️ Không thể đáo cho '{title}'.kiểm tra dữ liệu.")
             return
 
         # --- INTERACTIVE MARK MODE ---
         matches = find_calendar_matches(kw)
-        send_telegram(chat_id, f"🔍 Đang tìm '{kw}' ... 🔄")
+        send_telegram(chat_id, f"🔍 Đang tìm ... 🔄  {kw} ")
         checked, unchecked = count_checked_unchecked(kw)
 
         # nếu không có mục chưa tích vẫn hiển thị thống kê
         if not matches or unchecked == 0:
             msg = (
-                f"🔎 '{kw}'\n\n"
+                f"💴    {kw}\n\n"
                 f"✅ Đã góp: {checked}\n"
-                f"🟡 Chưa góp: {unchecked}\n"
+                f"🛑 Chưa góp: {unchecked}\n\n"
                 f"💫 Không có mục chưa tích."
             )
             send_telegram(chat_id, msg)
             return
 
-        header = f"🔎 '{kw}'\n✅ Đã góp: {checked}\n🟡 Chưa góp: {unchecked}\n📤 /cancel.\n"
+        header = f"💴   {kw}\n\n✅ Đã góp: {checked}\n🛑 Chưa góp: {unchecked}\n\n📤 ngày chưa góp /cancel.\n"
         lines = []
         for i, (pid, title, date_iso, props) in enumerate(matches, start=1):
             ds = date_iso[:10] if date_iso else "-"
-            lines.append(f"{i}. [{ds}] {title}")
+            lines.append(f"{i}. [{ds}] {title} ☐ ")
 
         send_long_text(chat_id, header + "\n".join(lines))
         pending_confirm[str(chat_id)] = {
@@ -1315,6 +1345,11 @@ def handle_incoming_message(chat_id: int, text: str):
             "matches": matches,
             "expires": time.time() + WAIT_CONFIRM
         }
+        # ✅ Hiển thị thông báo chờ và khởi động animation
+        msg = send_telegram(chat_id, "⏳ Đang chờ phản hồi... 🔄")
+        message_id = msg.get("result", {}).get("message_id")
+        if message_id:
+            start_waiting_animation(chat_id, message_id, duration=int(WAIT_CONFIRM))
 
     except Exception as e:
         traceback.print_exc()
