@@ -317,9 +317,11 @@ def find_target_matches(keyword: str, db_id: str = TARGET_NOTION_DATABASE_ID) ->
 
     for p in pages:
         props = p.get("properties", {})
-        title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
+        title = extract_prop_text(props, "Title") or extract_prop_text(props, "Name") or ""
         title_clean = normalize_text(title).strip()
-        if title_clean == kw:
+
+        # match kiểu: G003-..., G003_xxx
+        if title_clean.startswith(kw):
             matches.append((p.get("id"), title, props))
 
     return matches
@@ -342,17 +344,15 @@ def find_calendar_matches(keyword: str) -> List[Tuple[str, str, Optional[str], D
     # 🧾 Duyệt từng page trong database
     for p in pages:
         props = p.get("properties", {})
-        title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
-        title_clean = normalize_text(title)
-        kw_clean = normalize_text(kw)
-        date_iso = None   # ✅ tránh lỗi "local variable referenced before assignment"
-        score = 0
-
-        # ---- LOGIC KHỚP TÊN ----
-        if title_clean == kw_clean or title_clean.strip() == kw_clean:
-            score = 2
-        else:
+        rel_key = find_prop_key(props, "Lịch G")
+        if not rel_key:
             continue
+        rel_arr = props.get(rel_key, {}).get("relation", [])
+        if not rel_arr:
+            continue
+        if rel_arr[0].get("id") != lich_g_id:
+            continue
+        score = 2      
 
         # ---- KIỂM TRA CHECKBOX (bỏ qua nếu đã tích) ----
         cb_key = (
@@ -390,8 +390,14 @@ def find_matching_all_pages_in_db(database_id: str, keyword: str, limit: int = 2
     out = []
     for p in pages:
         props = p.get("properties", {})
-        title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
-        if kw in normalize_text(title):
+        rel_key = find_prop_key(props, "Lịch G")
+        if not rel_key:
+            continue
+        rel_arr = props.get(rel_key, {}).get("relation", [])
+        if not rel_arr:
+            continue
+        if rel_arr[0].get("id") != lich_g_id:
+            continue
             date_key = find_prop_key(props, "Ngày") or find_prop_key(props, "Date")
             date_iso = None
             if date_key and props.get(date_key, {}).get("date"):
@@ -786,9 +792,13 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
 
         for p in all_pages:
             props_p = p.get("properties", {})
-            name_p = extract_prop_text(props_p, "Name") or ""
-            if kw in name_p.lower():
-                matched.append((p.get("id"), name_p))  # ✅ lưu cả id và tên để log
+            rel = props_p.get("Lịch G", {}).get("relation", [])
+            if not rel:
+                continue
+            # so sánh theo relation thay vì Name
+            if rel[0].get("id") != source_page_id:
+                continue
+        matched.append((p.get("id"), extract_prop_text(props_p, "Name") or ""))
 
         # --- 🧹 XÓA TOÀN BỘ NGÀY CŨ (CÓ BAR ANIMATION) ---
         total = len(matched)
@@ -1182,6 +1192,12 @@ def handle_incoming_message(chat_id: int, text: str):
         # --- PHÂN TÍCH LỆNH ---
         keyword, count, action = parse_user_command(raw)
         kw = keyword  # giữ lại cho auto-mark
+        # STEP: tìm page trong TARGET_NOTION_DATABASE_ID dựa vào mã khách (vd: G003)
+        target_pages = find_target_matches(keyword, db_id=TARGET_NOTION_DATABASE_ID)
+        if not target_pages:
+            send_telegram(chat_id, f"❌ Không tìm thấy khách {keyword} trong TARGET_NOTION_DATABASE_ID")
+            return
+        lich_g_id = target_pages[0][0]   # id của page G003-xxx
 
         # --- AUTO-MARK MODE ---
         if action == "mark" and count > 0:
@@ -1225,18 +1241,20 @@ def handle_incoming_message(chat_id: int, text: str):
             # --- Lọc đúng tên ---
             for p in pages:
                 props = p.get("properties", {})
-                title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
-                title_clean = normalize_text(title)
-                if title_clean != kw_clean:
+                rel_key = find_prop_key(props, "Lịch G")
+                if not rel_key:
                     continue
-
+                rel_arr = props.get(rel_key, {}).get("relation", [])
+                if not rel_arr:
+                    continue
+                if rel_arr[0].get("id") != lich_g_id:
+                    continue
                 date_key = find_prop_key(props, "Ngày Góp") or find_prop_key(props, "Date")
                 date_iso = None
                 if date_key:
                     df = props.get(date_key, {}).get("date")
                     if df:
                         date_iso = df.get("start")
-
                 matches.append((p.get("id"), title, date_iso, props))
 
             matches.sort(key=lambda x: (x[2] is None, x[2] or ""), reverse=True)
