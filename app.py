@@ -1359,5 +1359,4 @@ if __name__ == "__main__":
     print("TELEGRAM_TOKEN set?:", bool(TELEGRAM_TOKEN))
     threading.Thread(target=auto_ping_render, daemon=True).start()
     app.run(host="0.0.0.0", port=port)
-</parameter>
-</xai:function_call>
+    
