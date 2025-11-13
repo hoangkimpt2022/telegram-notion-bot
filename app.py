@@ -301,30 +301,43 @@ def parse_money_from_text(s: Optional[str]) -> float:
         return 0.0
 
 # ------------- FINDERS & LIST BUILDERS -------------
-def find_target_matches(keyword: str, db_id: str = TARGET_NOTION_DATABASE_ID) -> List[Tuple[str, str, Dict[str, Any]]]:
+def find_target_matches(keyword: str) -> List[Tuple[str, str, Dict[str, Any]]]:
     """
-    Tìm chính xác các page trong TARGET DB có tên trùng khớp hoàn toàn với keyword (không phân biệt hoa/thường hoặc dấu tiếng Việt).
-    Ví dụ: "hương" chỉ match "Hương", KHÔNG match "Hương 13" hoặc "Hương VIP".
+    Tìm khách dựa trên cột 'Lịch G' trong MAIN DB.
+    Người dùng có thể nhập: tên khách, tên rút gọn, hoặc mã Gxxx.
+    Kết quả trả về: danh sách khách (ID khách + Title khách).
     """
-    pages = []     # ✅ tránh lỗi pages chưa có giá trị
-    matches = []   # ✅ tránh lỗi matches chưa có giá trị
-
-    if not db_id:
-        return []
 
     kw = normalize_text(keyword).strip()
-    pages = query_database_all(db_id, page_size=MAX_QUERY_PAGE_SIZE)
+    pages = query_database_all(NOTION_DATABASE_ID, page_size=MAX_QUERY_PAGE_SIZE)
+
+    found = {}
+    results = []
 
     for p in pages:
         props = p.get("properties", {})
-        title = extract_prop_text(props, "Title") or extract_prop_text(props, "Name") or ""
-        title_clean = normalize_text(title).strip()
 
-        # match kiểu: G003-..., G003_xxx
-        if title_clean.startswith(kw):
-            matches.append((p.get("id"), title, props))
+        # lấy relation Lịch G
+        rel = props.get("Lịch G", {}).get("relation", [])
+        if not rel:
+            continue
 
-    return matches
+        khach_id = rel[0].get("id")
+        if not khach_id:
+            continue
+
+        # lấy tên khách từ chính relation target (để match tên nhập)
+        khach_title = rel[0].get("name", "") or ""
+
+        title_clean = normalize_text(khach_title)
+
+        # match user input
+        if kw in title_clean:
+            if khach_id not in found:
+                found[khach_id] = khach_title
+                results.append((khach_id, khach_title, props))
+
+    return results
 
 def find_calendar_matches(keyword: str) -> List[Tuple[str, str, Optional[str], Dict[str, Any]]]:
     """
@@ -1223,7 +1236,7 @@ def handle_incoming_message(chat_id: int, text: str):
                 send_telegram(chat_id, f"⚠️ Có {len(res['failed'])} mục đánh dấu lỗi.")
 
             checked, unchecked = count_checked_unchecked(kw)
-            send_telegram(chat_id, f"✅ Đã góp: {checked}\n🛑 Chưa góp: {unchecked}")
+            send_telegram(chat_id, f" {kw} /n ✅ Đã góp: {checked}\n🛑 Chưa góp: {unchecked}")
             return
 
         # --- UNDO ---
@@ -1335,7 +1348,7 @@ def handle_incoming_message(chat_id: int, text: str):
             return
 
         # --- INTERACTIVE MARK MODE ---
-        matches = find_calendar_matches(kw)
+        matches = find_calendar_matches(lich_g_id)
         send_telegram(chat_id, f"🔍 Đang tìm ... 🔄  {kw} ")
         checked, unchecked = count_checked_unchecked(kw)
 
@@ -1372,7 +1385,6 @@ def handle_incoming_message(chat_id: int, text: str):
     except Exception as e:
         traceback.print_exc()
         send_telegram(chat_id, f"❌ Lỗi xử lý: {e}")
-
 # ------------- BACKGROUND: sweep expired pending -------------
 def sweep_pending_expirations():
     while True:
