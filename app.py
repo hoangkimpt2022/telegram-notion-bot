@@ -1205,12 +1205,25 @@ def handle_incoming_message(chat_id: int, text: str):
         # --- PHÂN TÍCH LỆNH ---
         keyword, count, action = parse_user_command(raw)
         kw = keyword  # giữ lại cho auto-mark
-        # STEP: tìm page trong TARGET_NOTION_DATABASE_ID dựa vào mã khách (vd: G003)
-        target_pages = find_target_matches(keyword)
-        if not target_pages:
-            send_telegram(chat_id, f"❌ Không tìm thấy khách {keyword} trong TARGET_NOTION_DATABASE_ID")
+
+        # STEP: tìm page Lịch G trong DB Góp (NOTION_DATABASE_ID) dựa trên cột relation "Lịch G"
+        # keyword là mã khách: G003
+        pages_in_main = query_notion_database(NOTION_DATABASE_ID)
+
+        lich_g_id = None
+        for pid, name, props in pages_in_main:
+            rel = props.get("Lịch G", {}).get("relation", [])
+            if rel:
+                # Lấy ID page Lịch G của khách
+                lg = rel[0].get("id", "")
+                # Check nếu title của page Lịch G chứa mã khách G003
+                if keyword.lower() in extract_prop_text(props, "Lịch G").lower():
+                    lich_g_id = lg
+                    break
+
+        if not lich_g_id:
+            send_telegram(chat_id, f"❌ Không tìm thấy khách có Lịch G chứa {keyword} trong NOTION_DATABASE_ID")
             return
-        lich_g_id = target_pages[0][0]   # id của page G003-xxx
 
         # --- AUTO-MARK MODE ---
         if action == "mark" and count > 0:
