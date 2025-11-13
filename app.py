@@ -315,19 +315,25 @@ def find_target_matches(keyword: str) -> List[Tuple[str, str, Dict[str, Any]]]:
     for p in pages:
         props = p.get("properties", {})
 
-        # lấy title của page (cột Lịch G ở TARGET_DB là title)
-        title = extract_prop_text(props, "Name") or ""
-        title_clean = normalize_text(title)
+        # lấy relation Lịch G
+        rel = props.get("Lịch G", {}).get("relation", [])
+        if not rel:
+            continue
 
-        # match user input (contains cho Linh, exact cho G001)
-        if kw.startswith('g') and kw[1:].isdigit():
-            if title_clean == kw:
-                results.append((p.get("id"), title, props))
-        else:
-            if kw in title_clean:
-                if p.get("id") not in found:
-                    found[p.get("id")] = title
-                    results.append((p.get("id"), title, props))
+        khach_id = rel[0].get("id")
+        if not khach_id:
+            continue
+
+        # lấy tên khách từ chính relation target (để match tên nhập)
+        khach_title = rel[0].get("name", "") or ""
+
+        title_clean = normalize_text(khach_title)
+
+        # match user input
+        if kw in title_clean:
+            if khach_id not in found:
+                found[khach_id] = khach_title
+                results.append((khach_id, khach_title, props))
 
     return results
 
@@ -587,7 +593,6 @@ def mark_pages_by_indices(chat_id: str, keyword: str, matches: List[Tuple[str, s
             ok, res = update_page_properties(pid, update_props)
             if ok:
                 succeeded.append((pid, title, date_iso))
-                undo_stack.setdefault(str(chat_id), []).append({"action": "mark", "page_id": pid})
             else:
                 failed.append((pid, res))
         except Exception as e:
@@ -617,48 +622,6 @@ def update_checkbox(page_id: str, value: bool) -> Tuple[bool, Any]:
     except Exception as e:
         print(f"⚠️ update_checkbox error: {e}")
         return False, str(e)
-
-
-def mark_pages_by_indices(chat_id: str, keyword: str,
-                          matches: List[Tuple[str, str, Optional[str], Dict[str, Any]]],
-                          indices: List[int]) -> Dict[str, Any]:
-    """
-    Đánh dấu page theo index, đồng thời ghi log undo để có thể hoàn tác.
-    - Nếu user nhập 1 số (vd: 5) => đánh dấu từ 1..5 (oldest first).
-    """
-    succeeded = []
-    failed = []
-
-    # Xử lý auto-expand "gam 3" -> đánh dấu 3 mục đầu
-    if len(indices) == 1 and indices[0] > 1:
-        n = indices[0]
-        indices = list(range(1, min(n, len(matches)) + 1))
-
-    for idx in indices:
-        if idx < 1 or idx > len(matches):
-            failed.append((idx, "index out of range"))
-            continue
-
-        pid, title, date_iso, props = matches[idx - 1]
-        try:
-            cb_key = find_prop_key(props, "Đã Góp") or find_prop_key(props, "Sent") or find_prop_key(props, "Status")
-            update_props = {cb_key or "Đã Góp": {"checkbox": True}}
-            ok, res = update_page_properties(pid, update_props)
-            if ok:
-                succeeded.append((pid, title))
-            else:
-                failed.append((pid, res))
-        except Exception as e:
-            failed.append((pid, str(e)))
-
-    # ✅ Ghi log undo (chỉ khi có page thành công)
-    if succeeded:
-        undo_stack[str(chat_id)] = {
-            "action": "mark",
-            "pages": [pid for pid, _ in succeeded]
-        }
-
-    return {"ok": len(failed) == 0, "succeeded": succeeded, "failed": failed}
 
 
 def undo_last(chat_id: str, count: int = 1):
@@ -1020,28 +983,6 @@ def handle_incoming_message(chat_id: int, text: str):
                 ).start()
                 return
 
-            if pc.get("type") == "select_id":
-                indices = parse_user_selection_text(raw, len(pc["matches"]))
-                if not indices:
-                    send_telegram(chat_id, "Không nhận được lựa chọn hợp lệ.")
-                    return
-                selected_matches = [pc["matches"][i - 1] for i in indices if 1 <= i <= len(pc["matches"])]
-                if not selected_matches:
-                    send_telegram(chat_id, "Không có mục được chọn.")
-                    del pending_confirm[str(chat_id)]
-                    return
-                # Tiếp tục action gốc với selected_matches
-                action = pc.get("action")
-                count = pc.get("count")
-                keyword = pc.get("keyword")
-                # Ví dụ cho mark
-                if action == "mark" and count > 0:
-                    res = mark_pages_by_indices(chat_id, keyword, selected_matches, list(range(1, count + 1)))
-                    # Xử lý res tương tự
-                # Tương tự cho archive, etc.
-                del pending_confirm[str(chat_id)]
-                return
-
             threading.Thread(
                 target=process_pending_selection, 
                 args=(chat_id, raw),
@@ -1359,4 +1300,3 @@ if __name__ == "__main__":
     print("TELEGRAM_TOKEN set?:", bool(TELEGRAM_TOKEN))
     threading.Thread(target=auto_ping_render, daemon=True).start()
     app.run(host="0.0.0.0", port=port)
-    
