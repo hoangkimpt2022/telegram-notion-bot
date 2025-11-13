@@ -339,7 +339,7 @@ def find_target_matches(keyword: str) -> List[Tuple[str, str, Dict[str, Any]]]:
 
     return results
 
-def find_calendar_matches(keyword: str) -> List[Tuple[str, str, Optional[str], Dict[str, Any]]]:
+def find_calendar_matches(lich_g_id: str) -> List[Tuple[str, str, Optional[str], Dict[str, Any]]]:
     """
     Trả về danh sách các page chưa tích trong NOTION_DATABASE_ID khớp với keyword.
     Sắp xếp tăng dần theo ngày Góp.
@@ -1206,7 +1206,7 @@ def handle_incoming_message(chat_id: int, text: str):
         keyword, count, action = parse_user_command(raw)
         kw = keyword  # giữ lại cho auto-mark
         # STEP: tìm page trong TARGET_NOTION_DATABASE_ID dựa vào mã khách (vd: G003)
-        target_pages = find_target_matches(keyword, db_id=TARGET_NOTION_DATABASE_ID)
+        target_pages = find_target_matches(keyword)
         if not target_pages:
             send_telegram(chat_id, f"❌ Không tìm thấy khách {keyword} trong TARGET_NOTION_DATABASE_ID")
             return
