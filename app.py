@@ -584,7 +584,7 @@ def dao_preview_text_from_props(title: str, props: dict):
                 msg = (
                     f"🔔 đáo lại cho: {title} - Tổng CK: ✅ {int(total_val)}\n\n"
                     f"💴 Không Lấy trước\n"
-                    f"📆 Bắt đầu góp lại từ ngày mai\n"
+                    f"📆 ngày mai Bắt đầu góp lại \n"
                     f"{restart}"
                 )
                 props["ONLY_LAI"] = True
@@ -599,12 +599,12 @@ def dao_preview_text_from_props(title: str, props: dict):
             lines = [
                 f"🔔 Đáo lại cho: {title} ",
                 f"💴 Lấy trước: {take_days} ngày {int(per_day)} là {total_pre}",
-                f"📆 (bắt đầu từ ngày mai):",
+                f"   ( từ ngày mai):",
             ]
             for idx, d in enumerate(date_list, start=1):
                 lines.append(f"{idx}. {d}")
-            lines.append(f"📆 Đến ngày {restart_date} bắt đầu góp lại")
-            lines.append(f"🏛️ Tổng CK: ✅ {int(total_val)}")        
+            lines.append(f"\n🏛️ Tổng CK: ✅ {int(total_val)}")         
+            lines.append(f"📆 Đến ngày {restart_date} bắt đầu góp lại")              
             return True, "\n".join(lines)
 
         # fallback
@@ -1478,26 +1478,16 @@ def handle_incoming_message(chat_id: int, text: str):
                 preview = f"🔔 Đáo lại cho: {title}\n⚠️ Không lấy được dữ liệu preview."
 
             if can:
-                preview_text = (
-                    f"{preview}\n\n"
+                send_telegram(chat_id, preview)
+                ok_msg = send_telegram(
+                    chat_id,
                     f"⚠️ Gõ /ok trong {WAIT_CONFIRM}s hoặc /cancel."
                 )
-
-                # gửi PREVIEW (không animation)
-                preview_msg = send_telegram(chat_id, preview_text)
-
-                # gửi tin countdown RIÊNG
-                timer_msg = send_telegram(
-                    chat_id,
-                    f"⏳ Chờ xác nhận trong {WAIT_CONFIRM}s ..."
-                )
-
                 # lấy message_id an toàn
                 try:
-                    timer_message_id = timer_msg.get("result", {}).get("message_id")
+                    timer_message_id = ok_msg.get("result", {}).get("message_id")
                 except:
                     timer_message_id = None
-
                 pending_confirm[str(chat_id)] = {
                     "type": "dao_confirm",
                     "source_page_id": pid,
@@ -1506,17 +1496,14 @@ def handle_incoming_message(chat_id: int, text: str):
                     "expires": time.time() + WAIT_CONFIRM,
                     "timer_message_id": timer_message_id
                 }
-
-                # chạy countdown trên tin RIÊNG
                 start_waiting_animation(
                     chat_id,
                     timer_message_id,
                     WAIT_CONFIRM,
-                    interval=2.0,
+                    interval=5.0,
                     label="xác nhận đáo"
                 )
                 return
-
             # nếu không đáo được
             send_telegram(
                 chat_id,
@@ -1540,7 +1527,7 @@ def handle_incoming_message(chat_id: int, text: str):
             send_telegram(chat_id, msg)
             return
 
-        header = f"💴 {kw}\n\n✅ Đã góp: {checked}\n🟡 Chưa góp: {unchecked}\n\n📤 ngày chưa góp/cancel.\n"
+        header = f"💴 {kw}\n\n✅ Đã góp: {checked}\n🟡 Chưa góp: {unchecked}\n\n📤 ngày chưa góp /cancel.\n"
         lines = []
         for i, (pid, title, date_iso, props) in enumerate(matches, start=1):
             ds = date_iso[:10] if date_iso else "-"
