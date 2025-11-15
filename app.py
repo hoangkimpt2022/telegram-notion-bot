@@ -972,47 +972,19 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
         time.sleep(0.5)
 
 
-        # ----------- 3) TẠO LÃI ----------- 
+        # --- 3️⃣ TẠO LÃI (nếu có) ---
         lai_text = extract_prop_text(props, "Lai lịch g") or extract_prop_text(props, "Lãi") or extract_prop_text(props, "Lai") or ""
         lai_amt = parse_money_from_text(lai_text) or 0
-
         if LA_NOTION_DATABASE_ID and lai_amt > 0:
-            update(f"💸 Đang tạo Lãi cho '{title}'...")
-            try:
-                create_lai_page(chat_id, title, lai_amt, source_page_id)
-                update(f"💸 Đã tạo Lãi: {int(lai_amt):,}")
-            except:
-                update(f"⚠️ Lỗi tạo Lãi")
+            send_telegram(chat_id, f"💸 Tiếp tục tạo Lãi cho {title}...")
+            create_lai_page(chat_id, title, lai_amt, source_page_id)
         else:
-            update(f"ℹ️ Không có Lãi hoặc không bật LA_NOTION_DATABASE_ID")
-
-        time.sleep(0.5)
-
-
-        # ---------- 4) HOÀN TẤT ----------
-        try:
-            update(f"🎉 Hoàn thành tiến trình đáo cho '{title}'! 🎉")
-
-        except Exception as e:
-
-            # thử update trước (nếu update đã được định nghĩa)
-            try:
-                update(f"❌ Lỗi tiến trình đáo cho {title}: {str(e)}")
-            except NameError:
-                # nếu update chưa tồn tại thì fallback sang send_telegram
-                try:
-                    send_telegram(chat_id, f"❌ Lỗi tiến trình đáo cho {title}: {str(e)}")
-                except:
-                    pass
-            except Exception:
-                # nếu update lỗi, fallback về send_telegram
-                try:
-                    send_telegram(chat_id, f"❌ Lỗi tiến trình đáo cho {title}: {str(e)}")
-                except:
-                    pass
-
-            traceback.print_exc()
-            return
+            send_telegram(chat_id, f"ℹ️ Không có giá trị Lãi hoặc chưa cấu hình LA_NOTION_DATABASE_ID. Bỏ qua tạo Lãi.")
+        send_telegram(chat_id, "✅ Hoàn thành tiến trình đáo! 🎉")
+    except Exception as e:
+        send_telegram(chat_id, f"❌ Lỗi tiến trình đáo cho {title}: {str(e)}")
+        traceback.print_exc()
+        return
 
 # ------------- PENDING / SELECTION PROCESSING -------------
 def parse_user_selection_text(sel_text: str, found_len: int) -> List[int]:
