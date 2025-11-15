@@ -1198,7 +1198,7 @@ def process_pending_selection(chat_id: str, raw: str):
 
             # 📊 Thống kê sau khi mark
             checked, unchecked = count_checked_unchecked(keyword)
-            send_telegram(chat_id, f"📊 Đã tích: {checked}\n🟡 Chưa tích: {unchecked}")
+            send_telegram(chat_id, f"💴 {keyword}\n📊 Đã góp: {checked}\n🟡 Chưa góp: {unchecked}")
 
             del pending_confirm[key]
             return
@@ -1341,8 +1341,9 @@ def handle_incoming_message(chat_id: int, text: str):
             threading.Thread(target=undo_last, args=(chat_id, 1), daemon=True).start()
             return
 
-        # 📦 ARCHIVE MODE — XÓA NGÀY CỤ THỂ (CÓ BAR ANIMATION)
+        # 📦 ARCHIVE MODE — XÓA NGÀY CỤ THỂ (KHÔNG CHỒNG ANIMATION)
         if action == "archive":
+            send_telegram(chat_id, f"🗑️đang tìm ⏳...{kw} ")
             kw_clean = normalize_text(keyword)
             pages = query_database_all(NOTION_DATABASE_ID, page_size=MAX_QUERY_PAGE_SIZE)
             matches = []
@@ -1365,141 +1366,163 @@ def handle_incoming_message(chat_id: int, text: str):
                 matches.append((p.get("id"), title, date_iso, props))
 
             matches.sort(key=lambda x: (x[2] is None, x[2] or ""), reverse=True)
+
             if not matches:
                 send_telegram(chat_id, f"❌ Không tìm thấy '{kw}'.")
                 return
 
+            # ===== HIỂN THỊ DANH SÁCH =====
             header = f"🗑️ Chọn mục cần xóa cho '{kw}':\n\n"
             lines = []
             for i, (pid, title, date_iso, props) in enumerate(matches, start=1):
                 ds = date_iso[:10] if date_iso else "-"
                 lines.append(f"{i}. [{ds}] {title}")
 
-            msg = send_telegram(chat_id, header + "\n".join(lines))
-            message_id = msg.get("result", {}).get("message_id")
+            # Gửi tin danh sách (KHÔNG animation ở đây)
+            list_msg = send_telegram(chat_id, header + "\n".join(lines))
 
+            # ===== TẠO TIN COUNTDOWN RIÊNG =====
+            timer_msg = send_telegram(
+                chat_id,
+                f"⏳ Đang chờ bạn chọn trong {WAIT_CONFIRM}s ...\nNhập số hoặc /cancel"
+            )
+
+            try:
+                timer_message_id = timer_msg.get("result", {}).get("message_id")
+            except:
+                timer_message_id = None
+
+            # ===== LƯU pending =====
             pending_confirm[str(chat_id)] = {
                 "type": "archive_select",
                 "keyword": kw,
                 "matches": matches,
                 "expires": time.time() + WAIT_CONFIRM,
-                "timer_message_id": message_id
+                "timer_message_id": timer_message_id
             }
 
-            start_waiting_animation(chat_id, message_id, WAIT_CONFIRM, label="chọn mục xóa")
+            # ===== ANIMATION (trên tin Timer) =====
+            start_waiting_animation(
+                chat_id,
+                timer_message_id,
+                WAIT_CONFIRM,
+                interval=2.0,
+                label="chọn mục xóa"
+            )
+            return
 
-               # --- ĐÁO ---
+        # --- ĐÁO ---
         if action == "dao":
             send_telegram(chat_id, f"💼 Đang xử lý đáo cho {kw} ... ⏳")
             matches = find_target_matches(kw)
+
             if not matches:
                 send_telegram(chat_id, f"⚠️ Không tìm thấy {kw} trong DB đáo.")
                 return
 
             # ======================================================
-            # 1) NHIỀU KẾT QUẢ → SHOW DANH SÁCH + CHỜ CHỌN
+            # 1) NHIỀU KẾT QUẢ → SHOW DANH SÁCH + TIN COUNTDOWN RIÊNG
             # ======================================================
             if len(matches) > 1:
-                header = f"💼 Chọn mục đáo cho '{kw}':"
+                header = f"💼 Chọn mục đáo cho '{kw}':\n\n"
                 lines = []
                 for i, (pid, title, props) in enumerate(matches, start=1):
                     lines.append(f"{i}. {title}")
 
-                full_text = header + "\n\n" + "\n".join(lines)
-                msg = send_telegram(chat_id, full_text)
+                # Gửi danh sách — KHÔNG animation lên tin này
+                list_msg = send_telegram(chat_id, header + "\n".join(lines))
+
+                # Gửi tin RIÊNG cho countdown
+                timer_msg = send_telegram(
+                    chat_id,
+                    f"⏳ Đang chờ bạn chọn trong {WAIT_CONFIRM}s ...\nNhập số hoặc /cancel"
+                )
 
                 # lấy message_id an toàn
-                if isinstance(msg, dict):
-                    message_id = msg.get("result", {}).get("message_id")
-                else:
-                    try:
-                        message_id = msg.get("message_id")
-                    except:
-                        message_id = None
+                try:
+                    timer_message_id = timer_msg.get("result", {}).get("message_id")
+                except:
+                    timer_message_id = None
 
+                # lưu thông tin chờ chọn
                 pending_confirm[str(chat_id)] = {
                     "type": "dao_choose",
                     "matches": matches,
                     "expires": time.time() + WAIT_CONFIRM,
-                    "timer_message_id": message_id
+                    "timer_message_id": timer_message_id,
                 }
 
-                # bắt animation countdown
+                # chạy countdown trên TIN NHẮN RIÊNG
                 start_waiting_animation(
                     chat_id,
-                    message_id,
+                    timer_message_id,
                     WAIT_CONFIRM,
                     interval=2.0,
                     label="chọn đáo"
                 )
-
-                send_telegram(
-                    chat_id,
-                    f"📤 Gửi số (ví dụ 1 hoặc 1-3) trong {WAIT_CONFIRM}s để chọn, hoặc /cancel."
-                )
                 return
 
             # ======================================================
-            # 2) CHỈ 1 KẾT QUẢ → TỰ ĐỘNG HIỂN THỊ PREVIEW + CHỜ /ok
+            # 2) CHỈ 1 KẾT QUẢ → PREVIEW + TIN COUNTDOWN RIÊNG
             # ======================================================
             pid, title, props = matches[0]
 
-            # safe call preview
+            # safe preview
             try:
                 can, preview = dao_preview_text_from_props(title, props)
             except Exception as e:
-                print("dao_preview_text_from_props threw:", e)
+                print("dao_preview_text_from_props ERROR:", e)
                 can, preview = False, ""
 
-            # fallback nếu preview rỗng
             if not preview:
-                preview = (
-                    f"🔔 Đáo lại cho: {title}\n"
-                    f"⚠️ Không lấy được dữ liệu preview. Vui lòng kiểm tra dữ liệu."
-                )
+                preview = f"🔔 Đáo lại cho: {title}\n⚠️ Không lấy được dữ liệu preview."
 
-            # preview hợp lệ → chờ xác nhận
             if can:
-                initial_text = (
+                preview_text = (
                     f"{preview}\n\n"
                     f"⚠️ Gõ /ok trong {WAIT_CONFIRM}s hoặc /cancel."
                 )
-                msg = send_telegram(chat_id, initial_text)
 
-                # lấy message_id
-                if isinstance(msg, dict):
-                    message_id = msg.get("result", {}).get("message_id")
-                else:
-                    try:
-                        message_id = msg.get("message_id")
-                    except:
-                        message_id = None
+                # gửi PREVIEW (không animation)
+                preview_msg = send_telegram(chat_id, preview_text)
+
+                # gửi tin countdown RIÊNG
+                timer_msg = send_telegram(
+                    chat_id,
+                    f"⏳ Chờ xác nhận trong {WAIT_CONFIRM}s ..."
+                )
+
+                # lấy message_id an toàn
+                try:
+                    timer_message_id = timer_msg.get("result", {}).get("message_id")
+                except:
+                    timer_message_id = None
 
                 pending_confirm[str(chat_id)] = {
                     "type": "dao_confirm",
                     "source_page_id": pid,
                     "props": props,
+                    "title": title,
                     "expires": time.time() + WAIT_CONFIRM,
-                    "timer_message_id": message_id
+                    "timer_message_id": timer_message_id
                 }
 
-                # animation countdown
+                # chạy countdown trên tin RIÊNG
                 start_waiting_animation(
                     chat_id,
-                    message_id,
+                    timer_message_id,
                     WAIT_CONFIRM,
                     interval=2.0,
                     label="xác nhận đáo"
                 )
                 return
 
-            # không thể đáo
-            else:
-                send_telegram(
-                    chat_id,
-                    f"⚠️ Không thể thực hiện đáo cho '{title}'. Vui lòng kiểm tra dữ liệu."
-                )
-                return
+            # nếu không đáo được
+            send_telegram(
+                chat_id,
+                f"⚠️ Không thể thực hiện đáo cho '{title}'. Vui lòng kiểm tra dữ liệu."
+            )
+            return
 
         # --- INTERACTIVE MARK MODE ---
         matches = find_calendar_matches(kw)
@@ -1524,18 +1547,19 @@ def handle_incoming_message(chat_id: int, text: str):
             lines.append(f"{i}. [{ds}] {title} ☐")
 
         msg = send_telegram(chat_id, header + "\n".join(lines))
-        message_id = msg.get("result", {}).get("message_id")
+        list_message_id = msg.get("result", {}).get("message_id")
+
+        timer_msg = send_telegram(chat_id, f"⏳ Đang chờ chọn {WAIT_CONFIRM}s ...")
+        timer_message_id = timer_msg.get("result", {}).get("message_id")
 
         pending_confirm[str(chat_id)] = {
             "type": "mark",
             "keyword": kw,
             "matches": matches,
             "expires": time.time() + WAIT_CONFIRM,
-            "timer_message_id": message_id
+            "timer_message_id": timer_message_id
         }
-
-        start_waiting_animation(chat_id, message_id, WAIT_CONFIRM, label="chọn đánh dấu")
-
+        start_waiting_animation(chat_id, timer_message_id, WAIT_CONFIRM, label="chọn đánh dấu")
 
     except Exception as e:
         traceback.print_exc()
