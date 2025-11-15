@@ -1509,7 +1509,7 @@ def handle_incoming_message(chat_id: int, text: str):
         # nếu không có mục chưa tích vẫn hiển thị thống kê
         if not matches or unchecked == 0:
             msg = (
-                f"💴 {title}\n\n"
+                f"💴 {kw}\n\n"
                 f"✅ Đã góp: {checked}\n"
                 f"🟡 Chưa góp: {unchecked}\n\n"
                 f"💫 Không có ngày chưa góp ."
@@ -1517,7 +1517,7 @@ def handle_incoming_message(chat_id: int, text: str):
             send_telegram(chat_id, msg)
             return
 
-        header = f"💴 {title}\n\n✅ Đã góp: {checked}\n🟡 Chưa góp: {unchecked}\n\n📤 ngày chưa góp/cancel.\n"
+        header = f"💴 {kw}\n\n✅ Đã góp: {checked}\n🟡 Chưa góp: {unchecked}\n\n📤 ngày chưa góp/cancel.\n"
         lines = []
         for i, (pid, title, date_iso, props) in enumerate(matches, start=1):
             ds = date_iso[:10] if date_iso else "-"
