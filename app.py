@@ -1195,10 +1195,11 @@ def process_pending_selection(chat_id: str, raw: str):
             if failed:
                 result_text += f"\n⚠️ Lỗi: {len(failed)} mục không thể cập nhật."
             edit_telegram_message(chat_id, message_id, result_text)
-
+            data["expires"] = 0
+            pending_confirm.pop(str(chat_id), None)
             # 📊 Thống kê sau khi mark
             checked, unchecked = count_checked_unchecked(keyword)
-            send_telegram(chat_id, f"💴 {keyword}\n📊 Đã góp: {checked}\n🟡 Chưa góp: {unchecked}")
+            send_telegram(chat_id, f"💴 {keyword}\n\n📊 Đã góp: {checked}\n🟡 Chưa góp: {unchecked}")
 
             del pending_confirm[key]
             return
