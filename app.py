@@ -1051,6 +1051,11 @@ def process_pending_selection_for_dao(chat_id: str, raw: str):
 
                 # ✅ Nếu chỉ tạo Lãi (không tạo page)
                 if props.get("ONLY_LAI"):
+                    try:
+                        archive_page(pid)    # <--- SỬA Ở ĐÂY (dùng pid, không dùng source_page_id)
+                    except Exception as e:
+                        print("Archive error:", e)
+
                     title = extract_prop_text(props, "Name") or "UNKNOWN"
                     lai_text = extract_prop_text(props, "Lai lịch g") or extract_prop_text(props, "Lãi") or extract_prop_text(props, "Lai") or ""
                     lai_amt = parse_money_from_text(lai_text) or 0
@@ -1060,6 +1065,8 @@ def process_pending_selection_for_dao(chat_id: str, raw: str):
                     else:
                         send_telegram(chat_id, f"⚠️ Không có giá trị Lãi hoặc chưa cấu hình LA_NOTION_DATABASE_ID.")
                     del pending_confirm[key]
+                    if "Không Lấy trước" in preview:
+                        props["ONLY_LAI"] = True
                     return
 
                 # ✅ Nếu bình thường → tạo page + lãi
@@ -1157,6 +1164,12 @@ def process_pending_selection(chat_id: str, raw: str):
         # ✅ MARK MODE — ĐÁNH DẤU (CHECK) CÁC MỤC CHỌN
         # ======================================================
         if action == "mark":
+            key = str(chat_id)
+            data = pending_confirm.get(key)
+            if not data:
+                send_telegram(chat_id, "⚠️ Không có thao tác đang chờ.")
+                return
+
             keyword = data.get("keyword")
             total_sel = len(indices)
             msg = send_telegram(chat_id, f"🟢 Bắt đầu đánh dấu {total_sel} mục cho '{keyword}' ...")
@@ -1194,12 +1207,22 @@ def process_pending_selection(chat_id: str, raw: str):
             result_text = f"✅ Hoàn tất đánh dấu {len(succeeded)}/{total_sel} mục 🎉"
             if failed:
                 result_text += f"\n⚠️ Lỗi: {len(failed)} mục không thể cập nhật."
-            pending_confirm.pop(str(chat_id), None)
+
+            # update result to the message (edit if possible)
+            try:
+                if message_id:
+                    edit_telegram_message(chat_id, message_id, result_text)
+                else:
+                    send_telegram(chat_id, result_text)
+            except Exception:
+                send_telegram(chat_id, result_text)
+
             # 📊 Thống kê sau khi mark
             checked, unchecked = count_checked_unchecked(keyword)
             send_telegram(chat_id, f"💴 {keyword}\n\n📊 Đã góp: {checked}\n🟡 Chưa góp: {unchecked}")
 
-            del pending_confirm[key]
+            # ---- DỌN SẠCH pending (chỉ 1 lần, an toàn) ----
+            pending_confirm.pop(key, None)
             return
 
         # ======================================================
@@ -1342,17 +1365,45 @@ def handle_incoming_message(chat_id: int, text: str):
 
         # 📦 ARCHIVE MODE — XÓA NGÀY CỤ THỂ (KHÔNG CHỒNG ANIMATION)
         if action == "archive":
-            send_telegram(chat_id, f"🗑️đang tìm ⏳...{kw} ")
-            kw_clean = normalize_text(keyword)
+            send_telegram(chat_id, f"🗑️đang tìm để xóa ⏳...{kw} ")
+
+            kw_norm = normalize_text(keyword)
             pages = query_database_all(NOTION_DATABASE_ID, page_size=MAX_QUERY_PAGE_SIZE)
             matches = []
 
-            # --- Lọc đúng tên ---
+            # --- Lọc bằng logic token/gcode (mềm hơn, không loại trừ checked) ---
+            is_gcode = bool(re.match(r'^g[0-9]+$', kw_norm))
+            kw_g = normalize_gcode(kw_norm) if is_gcode else None
+
             for p in pages:
                 props = p.get("properties", {})
                 title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
+                if not title:
+                    continue
                 title_clean = normalize_text(title)
-                if title_clean != kw_clean:
+                tokens = tokenize_title(title)
+
+                matched = False
+                # exact
+                if title_clean == kw_norm:
+                    matched = True
+                # gcode match on tokens
+                if not matched and is_gcode:
+                    for tk in tokens:
+                        if normalize_gcode(tk) == kw_g:
+                            matched = True
+                            break
+                # token contains
+                if not matched and not is_gcode:
+                    for tk in tokens:
+                        if kw_norm in tk:
+                            matched = True
+                            break
+                # fallback startswith
+                if not matched and title_clean.startswith(kw_norm + "-"):
+                    matched = True
+
+                if not matched:
                     continue
 
                 date_key = find_prop_key(props, "Ngày Góp") or find_prop_key(props, "Date")
@@ -1364,6 +1415,7 @@ def handle_incoming_message(chat_id: int, text: str):
 
                 matches.append((p.get("id"), title, date_iso, props))
 
+            # sort giống các chỗ khác
             matches.sort(key=lambda x: (x[2] is None, x[2] or ""), reverse=True)
 
             if not matches:
@@ -1413,10 +1465,11 @@ def handle_incoming_message(chat_id: int, text: str):
         # --- ĐÁO ---
         if action == "dao":
             send_telegram(chat_id, f"💼 Đang xử lý đáo cho {kw} ... ⏳")
-            matches = find_target_matches(kw)
 
+            # ---- TÌM DANH SÁCH KHÁCH ----
+            matches = find_target_matches(kw)
             if not matches:
-                send_telegram(chat_id, f"⚠️ Không tìm thấy {kw} trong DB đáo.")
+                send_telegram(chat_id, f"❌ Không tìm thấy '{kw}'.")
                 return
 
             # ======================================================
@@ -1428,35 +1481,31 @@ def handle_incoming_message(chat_id: int, text: str):
                 for i, (pid, title, props) in enumerate(matches, start=1):
                     lines.append(f"{i}. {title}")
 
-                # Gửi danh sách — KHÔNG animation lên tin này
-                list_msg = send_telegram(chat_id, header + "\n".join(lines))
+                # Gửi danh sách (KHÔNG animation)
+                send_telegram(chat_id, header + "\n".join(lines))
 
-                # Gửi tin RIÊNG cho countdown
+                # Tin countdown RIÊNG
                 timer_msg = send_telegram(
                     chat_id,
-                    f"⏳ Đang chờ bạn chọn trong {WAIT_CONFIRM}s ...\nNhập số hoặc /cancel"
+                    f"⏳ Đang chờ bạn chọn trong {WAIT_CONFIRM}s ...\nNhập số (vd: 1 hoặc 1-2) hoặc /cancel"
                 )
-
-                # lấy message_id an toàn
                 try:
-                    timer_message_id = timer_msg.get("result", {}).get("message_id")
+                    timer_message_id = timer_msg["result"]["message_id"]
                 except:
                     timer_message_id = None
 
-                # lưu thông tin chờ chọn
                 pending_confirm[str(chat_id)] = {
                     "type": "dao_choose",
                     "matches": matches,
                     "expires": time.time() + WAIT_CONFIRM,
-                    "timer_message_id": timer_message_id,
+                    "timer_message_id": timer_message_id
                 }
 
-                # chạy countdown trên TIN NHẮN RIÊNG
                 start_waiting_animation(
                     chat_id,
                     timer_message_id,
                     WAIT_CONFIRM,
-                    interval=2.0,
+                    interval=5.0,
                     label="chọn đáo"
                 )
                 return
@@ -1466,47 +1515,52 @@ def handle_incoming_message(chat_id: int, text: str):
             # ======================================================
             pid, title, props = matches[0]
 
-            # safe preview
+            # Lấy preview an toàn
             try:
                 can, preview = dao_preview_text_from_props(title, props)
             except Exception as e:
                 print("dao_preview_text_from_props ERROR:", e)
                 can, preview = False, ""
 
+            # Nếu không lấy preview được
             if not preview:
                 preview = f"🔔 Đáo lại cho: {title}\n⚠️ Không lấy được dữ liệu preview."
 
-            if can:
-                send_telegram(chat_id, preview)
-                ok_msg = send_telegram(
-                    chat_id,
-                    f"⚠️ Gõ /ok trong {WAIT_CONFIRM}s hoặc /cancel."
-                )
-                # lấy message_id an toàn
-                try:
-                    timer_message_id = ok_msg.get("result", {}).get("message_id")
-                except:
-                    timer_message_id = None
-                pending_confirm[str(chat_id)] = {
-                    "type": "dao_confirm",
-                    "source_page_id": pid,
-                    "props": props,
-                    "title": title,
-                    "expires": time.time() + WAIT_CONFIRM,
-                    "timer_message_id": timer_message_id
-                }
-                start_waiting_animation(
-                    chat_id,
-                    timer_message_id,
-                    WAIT_CONFIRM,
-                    interval=5.0,
-                    label="xác nhận đáo"
-                )
-                return
+            # ---- Gửi preview ----
+            send_telegram(chat_id, preview)
+
+            # ---- Gửi tin yêu cầu xác nhận ----
+            ok_msg = send_telegram(
+                chat_id,
+                f"⚠️ Gõ /ok trong {WAIT_CONFIRM}s hoặc /cancel."
+            )
+            try:
+                timer_message_id = ok_msg["result"]["message_id"]
+            except:
+                timer_message_id = None
+
+            # ---- Lưu pending ----
+            pending_confirm[str(chat_id)] = {
+                "type": "dao_confirm",
+                "targets": [(pid, title, props)],
+                "title": title,
+                "expires": time.time() + WAIT_CONFIRM,
+                "timer_message_id": timer_message_id
+            }
+
+            # ---- Chạy animation trên TIN /ok ----
+            start_waiting_animation(
+                chat_id,
+                timer_message_id,
+                WAIT_CONFIRM,
+                interval=5.0,
+                label="xác nhận đáo"
+            )
+            return
             # nếu không đáo được
             send_telegram(
                 chat_id,
-                f"⚠️ Không thể thực hiện đáo cho '{title}'. Vui lòng kiểm tra dữ liệu."
+                f" 🔴 chưa thể đáo cho '{title}'. kiểm tra lại."
             )
             return
 
