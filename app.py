@@ -1547,14 +1547,6 @@ def handle_incoming_message(chat_id: int, text: str):
                 pass
             send_telegram(chat_id, "Không có thao tác đang chờ. /cancel ignored.")
             return
-        if token in ("ok", "/ok", "yes", "đồng ý", "dong y"):
-            # ---- DỪNG ANIMATION NGAY LẬP TỨC ----
-            try:
-                stop_waiting_animation(chat_id)
-            except:
-                pass
-            send_telegram(chat_id, "✅ đã xác nhân ok .")
-            return
 
         # --- PHÂN TÍCH LỆNH ---
         keyword, count, action = parse_user_command(raw)
