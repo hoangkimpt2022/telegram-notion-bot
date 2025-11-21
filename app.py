@@ -1209,9 +1209,20 @@ def process_pending_selection_for_dao(chat_id: str, raw: str):
                 # CASE 1 — KHÔNG LẤY TRƯỚC → CHỈ XÓA NGÀY + TẠO LÃI
                 # =====================================================
                 if is_no_take:
-                    # tìm ngày theo relation Lịch G
-                    key_rel = find_prop_key(props, "Lịch G")
-                    children = props.get(key_rel, {}).get("relation", []) if key_rel else []
+
+                    # 🔍 Truy vấn trực tiếp Calendar DB để tìm ngày theo relation Lịch G
+                    calendar_pages = query_database_all(NOTION_DATABASE_ID, page_size=500)
+                    children = []
+
+                    for p in calendar_pages:
+                        props_p = p.get("properties", {})
+                        rel_key = find_prop_key(props_p, "Lịch G")
+                        if not rel_key:
+                            continue
+
+                        rel_arr = props_p.get(rel_key, {}).get("relation", [])
+                        if any(r.get("id") == pid for r in rel_arr):
+                            children.append(p.get("id"))
 
                     total = len(children)
                     msg = send_telegram(chat_id, f"🧹 Đang xóa ngày cũ của '{ttitle}' ...")
@@ -1220,25 +1231,19 @@ def process_pending_selection_for_dao(chat_id: str, raw: str):
                     def update(text):
                         if mid:
                             try:
-                                edit_telegram_message(chat_id, mid, text)
-                                return
-                            except:
-                                pass
+                                edit_telegram_message(chat_id, mid, text); return
+                            except: pass
                         send_telegram(chat_id, text)
 
                     if total == 0:
-                        update(f"🧹 Không có ngày nào cần xóa.")
+                        update("🧹 Không có ngày nào để xóa.")
                         time.sleep(0.3)
                     else:
                         update(f"🧹 Bắt đầu xóa {total} ngày ...")
                         time.sleep(0.25)
 
-                        for idx, row in enumerate(children, start=1):
-                            day_id = row["id"]
-                            try:
-                                archive_page(day_id)
-                            except:
-                                pass
+                        for idx, day_id in enumerate(children, start=1):
+                            archive_page(day_id)
 
                             bar = int((idx / total) * 10)
                             progress = "█" * bar + "░" * (10 - bar)
@@ -1251,11 +1256,11 @@ def process_pending_selection_for_dao(chat_id: str, raw: str):
                     # tạo Lãi
                     if LA_NOTION_DATABASE_ID and lai_amt > 0:
                         create_lai_page(chat_id, ttitle, lai_amt, pid)
-                        results.append((pid, ttitle, True, "Lãi Only"))
+                        results.append((pid, ttitle, True, "Lãi only"))
                     else:
                         results.append((pid, ttitle, False, "Không có lãi"))
 
-                    continue  # xong khách này → qua khách tiếp theo
+                    continue
 
                 # =====================================================
                 # CASE 2 — CÓ LẤY TRƯỚC → FULL DAO
