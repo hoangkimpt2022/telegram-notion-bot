@@ -1341,12 +1341,15 @@ def process_pending_selection_for_dao(chat_id: str, raw: str):
                     # Ghi log undo cho NHÁNH KHÔNG LẤY TRƯỚC
                     undo_stack.setdefault(str(chat_id), []).append({
                         "action": "dao",
-                        "archived_pages": [row["id"] for row in children],  # các ngày bị xóa
-                        "created_pages": [],                                # không tạo ngày mới
+                        "archived_pages": [
+                            row["id"]
+                            for row in children
+                            if isinstance(row, dict) and "id" in row
+                        ],
+                        "created_pages": [],          # không tạo ngày mới
                         "lai_page": lai_page_id
                     })
                     continue
-
 
                 # =====================================================
                 # CASE 2 — CÓ LẤY TRƯỚC → FULL DAO
