@@ -35,6 +35,8 @@ NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
 TARGET_NOTION_DATABASE_ID = os.getenv("TARGET_NOTION_DATABASE_ID", "")
 LA_NOTION_DATABASE_ID = os.getenv("LA_NOTION_DATABASE_ID", "")
 
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # optional: restrict bot to one chat id
 
