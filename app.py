@@ -1075,19 +1075,22 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
         )
         lai_amt = parse_money_from_text(lai_text) or 0
 
+        # Lưu id trang lãi vào biến để undo được
         if LA_NOTION_DATABASE_ID and lai_amt > 0:
-            create_lai_page(chat_id, title, lai_amt, source_page_id)
+            lai_page_id = create_lai_page(chat_id, title, lai_amt, source_page_id)
             send_telegram(chat_id, f"💰 Đã tạo Lãi cho {title}.")
         else:
+            lai_page_id = None
             send_telegram(chat_id, "ℹ️ Không có giá trị Lãi hoặc chưa cấu hình LA_NOTION_DATABASE_ID.")
 
         send_telegram(chat_id, "🎉 Hoàn tất đáo vào đặt lại Repeat every day liền!")
+
         # --- GHI LOG UNDO CHO CHẾ ĐỘ LẤY TRƯỚC ---
         undo_stack.setdefault(str(chat_id), []).append({
             "action": "dao",
-            "archived_pages": matched,                     # các ngày cũ đã xóa
+            "archived_pages": matched,                       # các ngày cũ đã xoá
             "created_pages": [p.get("id") for p in created], # các ngày mới tạo
-            "lai_page": lai_page_id 
+            "lai_page": lai_page_id                          # ID trang Lãi đã tạo
         })
 
     except Exception as e:
@@ -1313,12 +1316,21 @@ def process_pending_selection_for_dao(chat_id: str, raw: str):
 
                     # tạo Lãi
                     if LA_NOTION_DATABASE_ID and lai_amt > 0:
-                        create_lai_page(chat_id, ttitle, lai_amt, pid)
+                        lai_page_id = create_lai_page(chat_id, ttitle, lai_amt, pid)
                         results.append((pid, ttitle, True, "Lãi only"))
                     else:
+                        lai_page_id = None
                         results.append((pid, ttitle, False, "Không có lãi"))
 
+                    # Ghi log undo cho NHÁNH KHÔNG LẤY TRƯỚC
+                    undo_stack.setdefault(str(chat_id), []).append({
+                        "action": "dao",
+                        "archived_pages": [row["id"] for row in children],  # các ngày bị xóa
+                        "created_pages": [],                                # không tạo ngày mới
+                        "lai_page": lai_page_id
+                    })
                     continue
+
 
                 # =====================================================
                 # CASE 2 — CÓ LẤY TRƯỚC → FULL DAO
