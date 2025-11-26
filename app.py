@@ -1202,6 +1202,8 @@ def process_pending_selection_for_dao(chat_id: str, raw: str):
     # =========================================================
     if data.get("type") == "dao_confirm":
 
+        key = str(chat_id)
+
         # đảm bảo token luôn tồn tại
         token = (raw or "").strip().lower()
 
@@ -1211,6 +1213,12 @@ def process_pending_selection_for_dao(chat_id: str, raw: str):
 
         # ---------- CANCEL ----------
         if token in ("/cancel", "cancel", "hủy", "huỷ", "huy"):
+
+            # dừng countdown đúng cách
+            try:
+                data["expires"] = 0
+            except:
+                pass
             try:
                 stop_waiting_animation(chat_id)
             except:
@@ -1226,16 +1234,24 @@ def process_pending_selection_for_dao(chat_id: str, raw: str):
             return
 
         # ---------- OK ----------
+        # dừng countdown trước
+        try:
+            data["expires"] = 0
+        except:
+            pass
         try:
             stop_waiting_animation(chat_id)
         except:
             pass
 
-        data["expires"] = 0  # dừng countdown
-
         targets = data.get("targets") or []
         preview_text = data.get("preview_text") or ""
         title_all = data.get("title") or ""
+
+        if not targets:
+            pending_confirm.pop(key, None)
+            send_telegram(chat_id, "⚠️ Không có dữ liệu để đáo.")
+            return
 
         send_telegram(chat_id, f"✅ Đã xác nhận OK — đang xử lý đáo cho: {title_all}")
 
