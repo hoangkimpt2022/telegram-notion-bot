@@ -35,8 +35,6 @@ NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
 TARGET_NOTION_DATABASE_ID = os.getenv("TARGET_NOTION_DATABASE_ID", "")
 LA_NOTION_DATABASE_ID = os.getenv("LA_NOTION_DATABASE_ID", "")
 
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")  # optional: restrict bot to one chat id
 
@@ -691,69 +689,107 @@ def mark_pages_by_indices(chat_id: str, keyword: str, matches: List[Tuple[str, s
 
 def undo_last(chat_id: str, count: int = 1):
     """
-    Hoàn tác hành động cuối cùng (undo), ví dụ: bỏ check nhiều ngày vừa tích.
+    Hoàn tác hành động gần nhất.
+    Hỗ trợ:
+        - mark          → bỏ check
+        - archive       → unarchive
+        - dao (lấy trước)
+        - dao (không lấy trước)
     """
     chat_key = str(chat_id)
+
     if not undo_stack.get(chat_key):
         send_telegram(chat_id, "❌ Không có hành động nào để hoàn tác.")
         return
 
     log = undo_stack[chat_key].pop()
     if not log:
-        send_telegram(chat_id, "❌ Không có hành động nào để hoàn tác.")
+        send_telegram(chat_id, "❌ Không có dữ liệu undo.")
         return
 
-    action = log["action"]
-    pages = log.get("pages", [])
+    action = log.get("action")
 
-    total = len(pages)
-    if total == 0:
-        send_telegram(chat_id, "⚠️ Không tìm thấy danh sách page trong log undo.")
+    # ---------------------------------------------------------
+    # 1) UNDO — MARK / ARCHIVE (logic cũ)
+    # ---------------------------------------------------------
+    if action in ("mark", "archive"):
+        pages = log.get("pages", [])
+        total = len(pages)
+
+        if total == 0:
+            send_telegram(chat_id, "⚠️ Không có page trong log undo.")
+            return
+
+        msg = send_telegram(chat_id, f"♻️ Đang hoàn tác {total} mục ({action})...")
+        message_id = msg.get("result", {}).get("message_id")
+
+        undone = 0
+        failed = 0
+
+        for idx, pid in enumerate(pages, start=1):
+            try:
+                if action == "mark":
+                    update_checkbox(pid, False)
+                elif action == "archive":
+                    unarchive_page(pid)
+
+                bar = int((idx / total) * 10)
+                progress = "█" * bar + "░" * (10 - bar)
+                icon = ["♻️", "🔄", "💫", "✨"][idx % 4]
+
+                edit_telegram_message(chat_id, message_id,
+                                      f"{icon} Hoàn tác {idx}/{total} [{progress}]")
+                undone += 1
+                time.sleep(0.3)
+
+            except Exception as e:
+                print("Undo lỗi:", e)
+                failed += 1
+
+        final = f"✅ Hoàn tác {undone}/{total} mục"
+        if failed:
+            final += f" (⚠️ {failed} lỗi)"
+        edit_telegram_message(chat_id, message_id, final)
         return
 
-    # Gửi message ban đầu để update tiến trình
-    msg = send_telegram(chat_id, f"♻️ Đang hoàn tác {total} mục cho action '{action}'...")
-    message_id = msg.get("result", {}).get("message_id")
-
-    undone = 0
-    failed = 0
-
-    for idx, pid in enumerate(pages, start=1):
-        try:
-            if action == "mark":
-                update_checkbox(pid, False)  # Bỏ check
-            elif action == "archive":
-                unarchive_page(pid)  # Khôi phục từ archive
-            bar = int((idx / total) * 10)
-            progress = "█" * bar + "░" * (10 - bar)
-            icon = ["♻️", "🔄", "💫", "✨"][idx % 4]
-            new_text = f"{icon} Đang hoàn tác {idx}/{total} [{progress}]"
-            edit_telegram_message(chat_id, message_id, new_text)
-            undone += 1
-            time.sleep(0.5)
-        except Exception as e:
-            print("Undo lỗi:", e)
-            failed += 1
-
-    # Cập nhật kết quả cuối cùng
-    final_text = f"✅ Hoàn tất hoàn tác {undone}/{total} mục"
-    if failed:
-        final_text += f" (⚠️ lỗi {failed} mục)"
-    edit_telegram_message(chat_id, message_id, final_text + " 🎉")
-
-    # Support dao
+    # ---------------------------------------------------------
+    # 2) UNDO — ĐÁO (LẤY TRƯỚC / KHÔNG LẤY TRƯỚC)
+    # ---------------------------------------------------------
     if action == "dao":
         created_pages = log.get("created_pages", [])
-        lai_page = log.get("lai_page")
         archived_pages = log.get("archived_pages", [])
-        # Archive created and lai
+        lai_page = log.get("lai_page")
+
+        send_telegram(chat_id, "♻️ Đang hoàn tác đáo...")
+
+        # --- A) Xóa các ngày mới tạo (nếu có)
         for pid in created_pages:
-            archive_page(pid)
+            try:
+                archive_page(pid)
+            except Exception as e:
+                print("Undo dao — delete created_page lỗi:", e)
+
+        # --- B) Xóa page LÃI nếu có
         if lai_page:
-            archive_page(lai_page)
-        # Unarchive old
+            try:
+                archive_page(lai_page)
+            except Exception as e:
+                print("Undo dao — delete lai_page lỗi:", e)
+
+        # --- C) Khôi phục lại những ngày cũ đã archive
         for pid in archived_pages:
-            unarchive_page(pid)
+            try:
+                unarchive_page(pid)
+            except Exception as e:
+                print("Undo dao — restore old_day lỗi:", e)
+
+        send_telegram(chat_id, "✅ Hoàn tác đáo thành công.")
+        return
+
+    # ---------------------------------------------------------
+    # 3) FALLBACK — không xác định được loại undo
+    # ---------------------------------------------------------
+    send_telegram(chat_id, f"⚠️ Không hỗ trợ undo cho action '{action}'.")
 
 # ------------- ACTIONS: archive -------------
 def handle_command_archive(chat_id: str, keyword: str, auto_confirm_all: bool = True) -> Dict[str, Any]:
@@ -828,53 +864,61 @@ def create_lai_page(chat_id: int, title: str, lai_amount: float, relation_id: st
 # ------------- DAO flow (xóa + tạo pages + create lai) -------------
 def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[str, Any]):
     """
-    Tiến trình đáo – giữ nguyên logic Lấy Trước.
-    Riêng phần KHÔNG LẤY TRƯỚC: chỉ xóa ngày + tạo Lãi (không tạo ngày mới).
+    Tiến trình đáo:
+    - Nếu KHÔNG LẤY TRƯỚC: chỉ xóa ngày + tạo Lãi (không tạo ngày mới)
+    - Nếu CÓ LẤY TRƯỚC: giữ nguyên logic đáo đầy đủ
     """
-    try:
-        # ----------- LẤY DỮ LIỆU ----------- 
-        title = extract_prop_text(props, "Name") or "UNKNOWN"
-        total_text = extract_prop_text(props, "Đáo/thối")
-        total_val = parse_money_from_text(total_text) or 0
 
+    try:
+        # -----------------------------------------
+        # LẤY DỮ LIỆU
+        # -----------------------------------------
+        title = extract_prop_text(props, "Name") or "UNKNOWN"
+        total_val = parse_money_from_text(extract_prop_text(props, "Đáo/thối")) or 0
         per_day = parse_money_from_text(extract_prop_text(props, "G ngày")) or 0
         days_before = parse_money_from_text(extract_prop_text(props, "ngày trước")) or 0
         pre_amount = parse_money_from_text(extract_prop_text(props, "trước")) or 0
 
-        # ----------------------------------------------------
-        # 0️⃣ TRƯỜNG HỢP KHÔNG LẤY TRƯỚC
-        # ----------------------------------------------------
+        # -----------------------------------------
+        # TẠO HÀM UPDATE CHUNG
+        # -----------------------------------------
+        start_msg = send_telegram(chat_id, f"⏳ Đang xử lý đáo cho '{title}' ...")
+        message_id = start_msg.get("result", {}).get("message_id")
+
+        def update(text):
+            if message_id:
+                try:
+                    edit_telegram_message(chat_id, message_id, text)
+                    return
+                except:
+                    pass
+            send_telegram(chat_id, text)
+
+        # -----------------------------------------
+        # 0️⃣ — NHÁNH KHÔNG LẤY TRƯỚC
+        # -----------------------------------------
         if pre_amount == 0:
-            # Gửi tin nhắn mở đầu
-            start_msg = send_telegram(chat_id, 
+            update(
                 f"🔔 Đáo lại cho: {title}\n"
                 f"🏛️ Tổng CK: {int(total_val)}\n"
                 f"💴 Không Lấy Trước."
             )
-            message_id = start_msg.get("result", {}).get("message_id")
+            time.sleep(0.4)
 
-            def update(text):
-                if message_id:
-                    try:
-                        edit_telegram_message(chat_id, message_id, text)
-                        return
-                    except:
-                        pass
-                send_telegram(chat_id, text)
-
-            # ----------- XÓA NGÀY CŨ ----------- 
+            # --- TÌM CÁC PAGE NGÀY CỦA KHÁCH ---
             all_pages = query_database_all(NOTION_DATABASE_ID, page_size=500)
             kw = title.strip().lower()
-            matched = []
+            children = []
 
             for p in all_pages:
                 props_p = p.get("properties", {})
                 name_p = extract_prop_text(props_p, "Name") or ""
                 if kw in name_p.lower():
-                    matched.append(p.get("id"))
+                    children.append(p.get("id"))
 
-            total = len(matched)
+            total = len(children)
 
+            # --- XÓA NGÀY CŨ ---
             if total == 0:
                 update(f"🧹 Không có ngày cũ để xóa cho '{title}'.")
                 time.sleep(0.3)
@@ -882,22 +926,22 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
                 update(f"🧹 Đang xóa {total} ngày của '{title}' ...")
                 time.sleep(0.3)
 
-                for idx, pid_day in enumerate(matched, start=1):
+                for idx, day_id in enumerate(children, start=1):
                     try:
-                        archive_page(pid_day)
+                        archive_page(day_id)
                     except Exception as e:
-                        print(f"⚠️ Lỗi archive page {pid_day}: {e}")
+                        print(f"⚠️ Lỗi archive: {day_id} — {e}")
 
                     bar = int((idx / total) * 10)
                     progress = "█" * bar + "░" * (10 - bar)
 
                     update(f"🧹 Xóa {idx}/{total} [{progress}]")
-                    time.sleep(0.25)
+                    time.sleep(0.28)
 
                 update(f"✅ Đã xóa toàn bộ {total} ngày cũ của '{title}' 🎉")
                 time.sleep(0.4)
 
-            # ----------- TẠO LÃI ----------- 
+            # --- TẠO LÃI ---
             lai_text = (
                 extract_prop_text(props, "Lai lịch g")
                 or extract_prop_text(props, "Lãi")
@@ -912,38 +956,37 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
             else:
                 update("ℹ️ Không có giá trị Lãi hoặc chưa cấu hình LA_NOTION_DATABASE_ID.")
 
-            update("🎉 Hoàn thành đáo — (KHÔNG LẤY TRƯỚC).")
-            return  # kết thúc nhánh không lấy trước
+            update("🎉 Hoàn thành đáo — KHÔNG LẤY TRƯỚC.")
+            # --- GHI LOG UNDO CHO CHẾ ĐỘ KHÔNG LẤY TRƯỚC ---
+            undo_stack.setdefault(str(chat_id), []).append({
+                "action": "dao",
+                "archived_pages": matched,      # các ngày bạn vừa xóa
+                "created_pages": [],            # không tạo ngày mới
+                "lai_page": lai_page_id if 'lai_page_id' in locals() else None
+            })
 
-        # ----------------------------------------------------
-        # 1️⃣ — LẤY TRƯỚC: GIỮ NGUYÊN LOGIC
-        # ----------------------------------------------------
+            return
+
+        # -----------------------------------------
+        # 1️⃣ — NHÁNH LẤY TRƯỚC (GIỮ NGUYÊN LOGIC)
+        # -----------------------------------------
 
         # Tính số ngày cần tạo
-        take_days = int(days_before) if days_before else \
-                    int(math.ceil(pre_amount / per_day)) if per_day else 0
+        take_days = (
+            int(days_before) if days_before else
+            int(math.ceil(pre_amount / per_day)) if per_day else 0
+        )
 
         if take_days <= 0:
-            send_telegram(chat_id, 
-                f"⚠️ Không tính được số ngày hợp lệ cho {title} "
+            update(
+                f"⚠️ Không tính được số ngày hợp lệ cho {title}\n"
                 f"(per_day={per_day}, pre_amount={pre_amount})"
             )
             return
 
-        # ----------- TIN CHẠY ANIMATION ----------- 
-        start_msg = send_telegram(chat_id, f"⏳ Bắt đầu đáo cho '{title}' ...")
-        message_id = start_msg.get("result", {}).get("message_id")
-
-        def update(text):
-            if message_id:
-                try:
-                    edit_telegram_message(chat_id, message_id, text)
-                    return
-                except:
-                    pass
-            send_telegram(chat_id, text)
-
-        # ----------- 1) XÓA NGÀY CŨ ----------- 
+        # -----------------------------------------
+        # XÓA NGÀY CŨ
+        # -----------------------------------------
         all_pages = query_database_all(NOTION_DATABASE_ID, page_size=500)
         kw = title.strip().lower()
         matched = []
@@ -961,29 +1004,30 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
             time.sleep(0.3)
         else:
             update(f"🧹 Đang xóa {total} ngày của '{title}' ...")
-            time.sleep(0.4)
+            time.sleep(0.3)
 
-            for idx, pid_day in enumerate(matched, start=1):
+            for idx, day_id in enumerate(matched, start=1):
                 try:
-                    archive_page(pid_day)
+                    archive_page(day_id)
                 except Exception as e:
-                    print(f"⚠️ Lỗi archive page {pid_day}: {e}")
+                    print(f"⚠️ Lỗi archive {day_id}: {e}")
 
                 bar = int((idx / total) * 10)
                 progress = "█" * bar + "░" * (10 - bar)
-
                 update(f"🧹 Xóa {idx}/{total} [{progress}]")
-                time.sleep(0.3)
+                time.sleep(0.28)
 
-            update(f"✅ Đã xóa xong {total} ngày cũ.")
+            update(f"✅ Đã xóa {total} ngày cũ của '{title}'.")
             time.sleep(0.4)
 
-        # ----------- 2) TẠO NGÀY MỚI (NHƯ CŨ) ----------- 
+        # -----------------------------------------
+        # TẠO NGÀY MỚI
+        # -----------------------------------------
         VN_TZ = timezone(timedelta(hours=7))
         now_vn = datetime.now(VN_TZ)
         start_date = now_vn.date() + timedelta(days=1)
 
-        update(f"🛠️ Đang tạo {take_days} ngày mới (từ ngày mai)...")
+        update(f"🛠️ Đang tạo {take_days} ngày mới ...")
         time.sleep(0.4)
 
         created = []
@@ -999,9 +1043,12 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
             }
 
             try:
-                url = "https://api.notion.com/v1/pages"
-                body = {"parent": {"database_id": NOTION_DATABASE_ID}, "properties": props_payload}
-                r = requests.post(url, headers=NOTION_HEADERS, json=body, timeout=15)
+                r = requests.post(
+                    "https://api.notion.com/v1/pages",
+                    headers=NOTION_HEADERS,
+                    json={"parent": {"database_id": NOTION_DATABASE_ID}, "properties": props_payload},
+                    timeout=15
+                )
                 if r.status_code in (200, 201):
                     created.append(r.json())
                 else:
@@ -1017,7 +1064,9 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
         update(f"✅ Đã tạo {len(created)} ngày mới cho '{title}' 🎉")
         time.sleep(0.4)
 
-        # ----------- 3) TẠO LÃI ----------- 
+        # -----------------------------------------
+        # TẠO LÃI
+        # -----------------------------------------
         lai_text = (
             extract_prop_text(props, "Lai lịch g")
             or extract_prop_text(props, "Lãi")
@@ -1032,7 +1081,7 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
         else:
             send_telegram(chat_id, "ℹ️ Không có giá trị Lãi hoặc chưa cấu hình LA_NOTION_DATABASE_ID.")
 
-        send_telegram(chat_id, "🎉 Hoàn tất đáo!")
+        send_telegram(chat_id, "🎉 Hoàn tất đáo vào đặt lại Repeat every day liền!")
 
     except Exception as e:
         send_telegram(chat_id, f"❌ Lỗi tiến trình đáo cho {title}: {e}")
