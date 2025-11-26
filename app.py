@@ -1082,6 +1082,13 @@ def dao_create_pages_from_props(chat_id: int, source_page_id: str, props: Dict[s
             send_telegram(chat_id, "ℹ️ Không có giá trị Lãi hoặc chưa cấu hình LA_NOTION_DATABASE_ID.")
 
         send_telegram(chat_id, "🎉 Hoàn tất đáo vào đặt lại Repeat every day liền!")
+        # --- GHI LOG UNDO CHO CHẾ ĐỘ LẤY TRƯỚC ---
+        undo_stack.setdefault(str(chat_id), []).append({
+            "action": "dao",
+            "archived_pages": matched,                     # các ngày cũ đã xóa
+            "created_pages": [p.get("id") for p in created], # các ngày mới tạo
+            "lai_page": lai_page_id 
+        })
 
     except Exception as e:
         send_telegram(chat_id, f"❌ Lỗi tiến trình đáo cho {title}: {e}")
