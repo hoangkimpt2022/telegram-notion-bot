@@ -1,2 +1,5 @@
 flask
 requests
+APScheduler
+pytz
+gunicorn
