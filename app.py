@@ -1988,6 +1988,17 @@ def telegram_webhook():
     text = message.get("text") or message.get("caption") or ""
 
     if chat_id and text:
+        def _forward():
+            try:
+                # adjust URL/port if your command_worker listens elsewhere
+                requests.post(
+                    "http://127.0.0.1:5001/process_command",
+                    json={"text": text, "chat_id": chat_id},
+                    timeout=2
+                )
+            except Exception as e:
+                # Log but do not raise — do not break webhook flow
+                print("Forward to command worker failed:", e)
         threading.Thread(
             target=handle_incoming_message,
             args=(chat_id, text),
