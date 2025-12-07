@@ -303,10 +303,25 @@ def start_scheduler():
 
 if __name__ == "__main__":
     log("remind_v1 starting — timezone:", TIMEZONE)
-    # Warm-run immediately
+
+    # --- Warm-run: chạy job 1 lần khi khởi động ---
     try:
         job_remind_once()
     except Exception as e:
         log("Warm-run error:", e)
         traceback.print_exc()
+
+    # --- TEST TELEGRAM DIRECT (debug) ---
+    try:
+        ok, resp = send_telegram(TELEGRAM_CHAT_ID, "TEST: Worker đang hoạt động")
+        if ok:
+            log("TEST TELEGRAM: OK")
+        else:
+            log("TEST TELEGRAM FAILED:", resp)
+    except Exception as e:
+        log("TEST TELEGRAM FAILED (exception):", e)
+        traceback.print_exc()
+
+    # --- BẮT ĐẦU LỊCH NHẮC ---
     start_scheduler()
+
