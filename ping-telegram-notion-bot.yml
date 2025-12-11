@@ -1,0 +1,52 @@
+name: Daily ping — Telegram Notion Bot
+
+# Chạy theo lịch + cho phép chạy thủ công
+on:
+  schedule:
+    # GitHub Actions dùng UTC.
+    # 08:50 VN (UTC+7) = 01:50 UTC -> cron: "50 1 * * *"
+    - cron: "50 1 * * *"
+  workflow_dispatch: {}
+
+env:
+  BASE_URL: "https://telegram-notion-bot-tpm2.onrender.com"
+  PATH_TO_PING: "/"            # đổi nếu muốn ping /health hoặc /ping
+  MAX_RETRIES: "3"
+  CURL_OPTS: "--max-time 15 -sS -w '\\nHTTP_CODE:%{http_code}\\n'"
+
+jobs:
+  ping:
+    name: Ping Telegram-Notion Bot (08:50 VN daily)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ping target (with retry)
+        run: |
+          url="${BASE_URL}${PATH_TO_PING}"
+          echo "Pinging: $url"
+          attempts=0
+          max_attempts=${MAX_RETRIES}
+          ok=0
+
+          while [ $attempts -lt $max_attempts ]; do
+            attempts=$((attempts + 1))
+            echo "Attempt #$attempts..."
+            resp=$(curl $CURL_OPTS "$url" 2>&1) || true
+            echo "$resp"
+            http_code=$(echo "$resp" | tr '\n' ' ' | sed -n "s/.*HTTP_CODE:\([0-9]\{3\}\).*/\1/p")
+            echo "HTTP code: ${http_code:-N/A}"
+            if echo "${http_code}" | grep -E '^2[0-9][0-9]$' >/dev/null; then
+              echo "Ping succeeded (HTTP ${http_code})."
+              ok=1
+              break
+            else
+              echo "Ping failed or non-2xx (HTTP ${http_code:-N/A})."
+              # backoff
+              sleep $((attempts * 2))
+            fi
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "All attempts failed."
+            exit 1
+          fi
