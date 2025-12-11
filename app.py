@@ -2030,7 +2030,33 @@ def auto_ping_render():
 
         # đợi 5 phút rồi ping lại
         time.sleep(300)  # 30780s = 13 phút
+def daily_ping_1355_vn():
+    """
+    Vào lúc 13:55 theo múi giờ VN (UTC+7) gửi GET tới remind-service.
+    Chạy liên tục trong background thread (daemon).
+    """
+    last_ping_date = None  # YYYY-MM-DD string của lần ping gần nhất
+    while True:
+        now_vn = datetime.now(VN_TZ)
+        today_str = now_vn.date().isoformat()
+        # Kiểm tra điều kiện: đúng 13:55 và chưa ping hôm nay
+        if now_vn.hour == 13 and now_vn.minute == 55 and last_ping_date != today_str:
+            try:
+                resp = requests.get("https://remind-service.onrender.com", timeout=10)
+                print(f"[DAILY PING] {datetime.now().isoformat()} -> {resp.status_code}")
+            except Exception as e:
+                print(f"[DAILY PING ERROR] {datetime.now().isoformat()} -> {e}")
+            # đánh dấu đã ping hôm nay
+            last_ping_date = today_str
+            # chờ đến sau phút 13:55 để tránh ping lại trong cùng phút
+            time.sleep(65)
 
+        # nếu đã qua 13:56 VN và last_ping_date là hôm qua (hoặc None) thì giữ nguyên;
+        # ngủ ngắn để giảm CPU
+        time.sleep(15)
+
+# Start the background thread as daemon so nó chạy cùng process app
+threading.Thread(target=daily_ping_1355_vn, daemon=True).start()
 # ------------- RUN (local test) -------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
