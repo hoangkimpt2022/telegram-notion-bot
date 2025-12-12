@@ -1,0 +1,9 @@
+name: schedule-test
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: date -u; echo "scheduled test"
