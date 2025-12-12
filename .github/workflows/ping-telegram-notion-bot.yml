@@ -3,7 +3,7 @@ name: Daily ping — Telegram Notion Bot
 on:
   # 08:55 VN = 01:55 UTC
   schedule:
-    - cron: "55 1 * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}   # cho phép chạy thủ công để test
 
 env:
