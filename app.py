@@ -1913,12 +1913,9 @@ def handle_incoming_message(chat_id: int, text: str):
         # --- PHÂN TÍCH LỆNH ---
         keyword, count, action = parse_user_command(raw)
         kw = keyword  # giữ lại cho auto-mark
-        # ===== SWITCH ON / OFF =====
-        low_raw = raw.strip().lower()
-
         if low_raw.endswith(" on"):
             threading.Thread(
-                target=switch_app.handle_switch_on,
+                target=handle_switch_on,
                 args=(chat_id, kw),
                 daemon=True
             ).start()
@@ -1926,7 +1923,7 @@ def handle_incoming_message(chat_id: int, text: str):
 
         if low_raw.endswith(" off"):
             threading.Thread(
-                target=switch_app.handle_switch_off,
+                target=handle_switch_off,
                 args=(chat_id, kw),
                 daemon=True
             ).start()
