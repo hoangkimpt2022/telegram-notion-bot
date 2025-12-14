@@ -1,7 +1,7 @@
 # ============================================================
 # switch_app.py
-# Plugin mở rộng cho app.py (ON / OFF / UNDO switch)
-# KHÔNG import app.py — dùng dependency injection (deps)
+# ON  = mở vòng góp (In progress + Thụ động + G + Ngày Đáo)
+# OFF = đóng vòng góp (Done + bỏ Thụ động + bỏ G + ngày xong)
 # ============================================================
 
 import time
@@ -9,276 +9,183 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 
 VN_TZ = timezone(timedelta(hours=7))
-
-# ============================================================
-# Dependency container (inject từ app.py)
-# ============================================================
 deps: Dict[str, Any] = {}
 
-
+# ================== INIT ==================
 def init_switch_deps(**kwargs):
-    """
-    app.py PHẢI gọi hàm này 1 lần sau khi load xong các hàm core.
-
-    Required keys:
-      send_telegram
-      edit_telegram_message
-      find_target_matches
-      extract_prop_text
-      parse_money_from_text
-      create_page_in_db
-      archive_page
-      unarchive_page
-      update_page_properties
-      create_lai_page
-      query_database_all
-      undo_stack
-      NOTION_DATABASE_ID
-      find_prop_key
-    """
     deps.update(kwargs)
 
-
-# ============================================================
-# Helper utilities
-# ============================================================
-def _now_vn_date() -> str:
+# ================== HELPERS ==================
+def today_vn():
     return datetime.now(VN_TZ).date().isoformat()
 
-
-def _progress_bar(i: int, total: int, width: int = 10) -> str:
-    if total <= 0:
-        return "█" * width
-    filled = max(1, int((i / total) * width))
-    return "█" * filled + "░" * (width - filled)
-
-
-def _safe_edit(chat_id: int, message_id: Optional[int], text: str):
+def safe_edit(chat_id, mid, text):
     try:
-        if message_id:
-            deps["edit_telegram_message"](chat_id, message_id, text)
+        if mid:
+            deps["edit_telegram_message"](chat_id, mid, text)
             return
     except Exception:
         pass
     deps["send_telegram"](chat_id, text)
 
+def prop_key(props, name_like):
+    return deps["find_prop_key"](props, name_like) or name_like
 
-def _snapshot_target(props: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Lưu snapshot các cột sẽ bị thay đổi để UNDO
-    """
+def snapshot_target(props):
     snap = {}
-    for name_like in [
-        "trạng thái",
-        "Tổng Quan Đầu Tư",
-        "Tổng Thụ Động",
-        "Ngày Đáo",
-        "ngày xong",
-    ]:
-        key = deps["find_prop_key"](props, name_like)
-        if key and key in props:
+    for k in ["trạng thái", "Tổng Quan Đầu Tư", "Tổng Thụ Động", "Ngày Đáo", "ngày xong"]:
+        key = prop_key(props, k)
+        if key in props:
             snap[key] = props[key]
     return snap
 
-
-def _restore_snapshot(page_id: str, snapshot: Dict[str, Any]):
-    if snapshot:
-        deps["update_page_properties"](page_id, snapshot)
-
-
-# ============================================================
-# SWITCH ON
-# ============================================================
+# ================== SWITCH ON ==================
 def handle_switch_on(chat_id: int, keyword: str):
-    send_telegram = deps["send_telegram"]
-    update_page_properties = deps["update_page_properties"]
-    find_target_matches = deps["find_target_matches"]
-    extract_prop_text = deps["extract_prop_text"]
-    parse_money = deps["parse_money_from_text"]
+    send = deps["send_telegram"]
+    find_target = deps["find_target_matches"]
+    update = deps["update_page_properties"]
     create_page = deps["create_page_in_db"]
+    parse_money = deps["parse_money_from_text"]
+    extract = deps["extract_prop_text"]
     undo_stack = deps["undo_stack"]
-    NOTION_DB = deps["NOTION_DATABASE_ID"]
-    find_prop_key = deps["find_prop_key"]
 
-    matches = find_target_matches(keyword)
+    matches = find_target(keyword)
     if not matches:
-        send_telegram(chat_id, f"❌ Không tìm thấy {keyword}")
+        send(chat_id, f"❌ Không tìm thấy {keyword}")
         return
 
-    page_id, title, props = matches[0]
-    msg = send_telegram(chat_id, f"🔄 Bật ON cho {title} ...")
+    pid, title, props = matches[0]
+    msg = send(chat_id, f"🔄 Đang bật ON cho {title} ...")
     mid = msg.get("result", {}).get("message_id")
 
-    snapshot = _snapshot_target(props)
+    snap = snapshot_target(props)
 
-    def pk(name_like: str) -> str:
-        return find_prop_key(props, name_like) or name_like
-
-    # --- Update target ---
-    update_page_properties(page_id, {
-        pk("trạng thái"): {"select": {"name": "In progress"}},
-        pk("Tổng Quan Đầu Tư"): {"select": {"name": "Thụ động"}},
-        pk("Tổng Thụ Động"): {"select": {"name": "G"}},
-        pk("Ngày Đáo"): {"date": {"start": _now_vn_date()}},
+    # === 1. UPDATE TARGET (BẮT BUỘC) ===
+    update(pid, {
+        prop_key(props, "trạng thái"): {"select": {"name": "In progress"}},
+        prop_key(props, "Tổng Quan Đầu Tư"): {"select": {"name": "Thụ động"}},
+        prop_key(props, "Tổng Thụ Động"): {"select": {"name": "G"}},
+        prop_key(props, "Ngày Đáo"): {"date": {"start": today_vn()}},
     })
-    _safe_edit(chat_id, mid, "⚙️ Đã cập nhật trạng thái, đang tạo ngày ...")
-    time.sleep(0.25)
 
-    # --- Read days ---
-    raw_days = extract_prop_text(props, "ngày trước") or "0"
+    safe_edit(chat_id, mid, "⚙️ Đã cập nhật TARGET → In progress / Thụ động / G")
+    time.sleep(0.3)
+
+    # === 2. CREATE DAYS ===
+    raw_days = extract(props, "ngày trước") or "0"
     try:
         days = int(float(raw_days))
-    except Exception:
+    except:
         days = 0
 
-    per_day = parse_money(extract_prop_text(props, "G ngày") or "")
-
-    created_pages: List[str] = []
+    per_day = parse_money(extract(props, "G ngày") or "")
+    created = []
     start = datetime.now(VN_TZ).date()
-
-    if days <= 0:
-        undo_stack.setdefault(str(chat_id), []).append({
-            "action": "switch_on",
-            "target_id": page_id,
-            "snapshot": snapshot,
-            "created_pages": [],
-        })
-        _safe_edit(chat_id, mid, f"✅ Đã bật ON cho {title} (không có ngày)")
-        return
 
     for i in range(days):
         d = start + timedelta(days=i)
-        payload = {
+        ok, res = create_page(deps["NOTION_DATABASE_ID"], {
             "Name": {"title": [{"text": {"content": title}}]},
             "Ngày Góp": {"date": {"start": d.isoformat()}},
             "Tiền": {"number": per_day},
             "Đã Góp": {"checkbox": True},
-            "Lịch G": {"relation": [{"id": page_id}]},
-        }
-        ok, res = create_page(NOTION_DB, payload)
-        if ok and isinstance(res, dict) and res.get("id"):
-            created_pages.append(res["id"])
-
-        bar = _progress_bar(i + 1, days)
-        _safe_edit(chat_id, mid, f"📆 {i+1}/{days} [{bar}]")
-        time.sleep(0.25)
+            "Lịch G": {"relation": [{"id": pid}]},
+        })
+        if ok and res.get("id"):
+            created.append(res["id"])
+        safe_edit(chat_id, mid, f"📆 {i+1}/{days} tạo ngày")
+        time.sleep(0.2)
 
     undo_stack.setdefault(str(chat_id), []).append({
         "action": "switch_on",
-        "target_id": page_id,
-        "snapshot": snapshot,
-        "created_pages": created_pages,
+        "target_id": pid,
+        "snapshot": snap,
+        "created_pages": created,
     })
 
-    _safe_edit(chat_id, mid, f"✅ Đã bật ON cho {title}")
+    safe_edit(chat_id, mid, f"✅ Đã bật ON cho {title}")
 
-
-# ============================================================
-# SWITCH OFF
-# ============================================================
+# ================== SWITCH OFF ==================
 def handle_switch_off(chat_id: int, keyword: str):
-    send_telegram = deps["send_telegram"]
-    update_page_properties = deps["update_page_properties"]
-    find_target_matches = deps["find_target_matches"]
-    extract_prop_text = deps["extract_prop_text"]
+    send = deps["send_telegram"]
+    find_target = deps["find_target_matches"]
+    update = deps["update_page_properties"]
+    extract = deps["extract_prop_text"]
     parse_money = deps["parse_money_from_text"]
-    archive_page = deps["archive_page"]
-    unarchive_page = deps["unarchive_page"]
-    create_lai_page = deps["create_lai_page"]
+    archive = deps["archive_page"]
+    create_lai = deps["create_lai_page"]
     query_all = deps["query_database_all"]
     undo_stack = deps["undo_stack"]
-    NOTION_DB = deps["NOTION_DATABASE_ID"]
-    find_prop_key = deps["find_prop_key"]
 
-    matches = find_target_matches(keyword)
+    matches = find_target(keyword)
     if not matches:
-        send_telegram(chat_id, f"❌ Không tìm thấy {keyword}")
+        send(chat_id, f"❌ Không tìm thấy {keyword}")
         return
 
-    page_id, title, props = matches[0]
-    msg = send_telegram(chat_id, f"⏳ Đang OFF {title} ...")
+    pid, title, props = matches[0]
+    msg = send(chat_id, f"⏳ Đang OFF {title} ...")
     mid = msg.get("result", {}).get("message_id")
 
-    snapshot = _snapshot_target(props)
+    snap = snapshot_target(props)
 
-    # --- Find & archive day pages ---
-    pages = query_all(NOTION_DB)
-    archived: List[str] = []
-
-    for p in pages:
+    # === 1. ARCHIVE ALL DAYS ===
+    archived = []
+    for p in query_all(deps["NOTION_DATABASE_ID"]):
         pprops = p.get("properties", {})
-        rel_key = find_prop_key(pprops, "Lịch G")
-        if not rel_key:
-            continue
-        rels = pprops.get(rel_key, {}).get("relation", [])
-        if any(r.get("id") == page_id for r in rels):
-            archive_page(p["id"])
+        rel_key = prop_key(pprops, "Lịch G")
+        if any(r.get("id") == pid for r in pprops.get(rel_key, {}).get("relation", [])):
+            archive(p["id"])
             archived.append(p["id"])
 
-    if archived:
-        for i in range(len(archived)):
-            bar = _progress_bar(i + 1, len(archived))
-            _safe_edit(chat_id, mid, f"🗑️ {i+1}/{len(archived)} [{bar}]")
-            time.sleep(0.25)
-
-    # --- Create Lãi ---
-    lai_amt = parse_money(extract_prop_text(props, "Lai lịch g") or "")
-    lai_page_id = None
+    # === 2. CREATE LAI ===
+    lai_amt = parse_money(extract(props, "Lai lịch g") or "")
+    lai_id = None
     if lai_amt > 0:
-        lai_page_id = create_lai_page(chat_id, title, lai_amt, page_id)
+        lai_id = create_lai(chat_id, title, lai_amt, pid)
 
-    # --- Update target ---
-    def pk(name_like: str) -> str:
-        return find_prop_key(props, name_like) or name_like
-
-    update_page_properties(page_id, {
-        pk("trạng thái"): {"select": {"name": "Done"}},
-        pk("Tổng Quan Đầu Tư"): {"select": None},
-        pk("Tổng Thụ Động"): {"select": None},
-        pk("ngày xong"): {"date": {"start": _now_vn_date()}},
+    # === 3. UPDATE TARGET (ĐÓNG VÒNG) ===
+    update(pid, {
+        prop_key(props, "trạng thái"): {"select": {"name": "Done"}},
+        prop_key(props, "Tổng Quan Đầu Tư"): {"select": None},
+        prop_key(props, "Tổng Thụ Động"): {"select": None},
+        prop_key(props, "ngày xong"): {"date": {"start": today_vn()}},
     })
 
     undo_stack.setdefault(str(chat_id), []).append({
         "action": "switch_off",
-        "target_id": page_id,
-        "snapshot": snapshot,
+        "target_id": pid,
+        "snapshot": snap,
         "archived_pages": archived,
-        "lai_page_id": lai_page_id,
+        "lai_page_id": lai_id,
     })
 
-    _safe_edit(chat_id, mid, f"✅ Đã OFF {title}")
+    safe_edit(chat_id, mid, f"✅ Đã OFF {title} – vòng góp kết thúc")
 
-
-# ============================================================
-# UNDO SWITCH
-# ============================================================
+# ================== UNDO ==================
 def undo_switch(chat_id: int):
-    send_telegram = deps["send_telegram"]
-    archive_page = deps["archive_page"]
-    unarchive_page = deps["unarchive_page"]
+    send = deps["send_telegram"]
+    unarchive = deps["unarchive_page"]
+    archive = deps["archive_page"]
     undo_stack = deps["undo_stack"]
 
     stack = undo_stack.get(str(chat_id), [])
     if not stack:
-        send_telegram(chat_id, "❌ Không có thao tác để undo")
+        send(chat_id, "❌ Không có thao tác để undo")
         return
 
     log = stack.pop()
-    _restore_snapshot(log["target_id"], log.get("snapshot", {}))
+    deps["update_page_properties"](log["target_id"], log["snapshot"])
 
     if log["action"] == "switch_on":
-        for pid in log.get("created_pages", []):
-            archive_page(pid)
-        send_telegram(chat_id, "♻️ Hoàn tác ON hoàn tất")
-        return
+        for pid in log["created_pages"]:
+            archive(pid)
+        send(chat_id, "♻️ Undo ON hoàn tất")
 
     if log["action"] == "switch_off":
-        for pid in log.get("archived_pages", []):
-            unarchive_page(pid)
+        for pid in log["archived_pages"]:
+            unarchive(pid)
         if log.get("lai_page_id"):
-            archive_page(log["lai_page_id"])
-        send_telegram(chat_id, "♻️ Hoàn tác OFF hoàn tất")
-        return
-
+            archive(log["lai_page_id"])
+        send(chat_id, "♻️ Undo OFF hoàn tất")
 
 __all__ = ["init_switch_deps", "handle_switch_on", "handle_switch_off", "undo_switch"]
