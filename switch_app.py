@@ -16,14 +16,25 @@ def init_switch_deps(**kwargs):
 def today():
     return datetime.now(VN_TZ).date().isoformat()
 
-def send(chat_id, text):
-    deps["send_telegram"](chat_id, text)
-
-def edit(chat_id, mid, text):
+def safe_send(chat_id, text):
     try:
-        deps["edit_telegram_message"](chat_id, mid, text)
-    except:
-        send(chat_id, text)
+        return deps["send_telegram"](chat_id, text)
+    except Exception:
+        return None
+
+def extract_mid(msg):
+    if isinstance(msg, dict):
+        return msg.get("result", {}).get("message_id")
+    return None
+
+def safe_edit(chat_id, mid, text):
+    if mid:
+        try:
+            deps["edit_telegram_message"](chat_id, mid, text)
+            return
+        except Exception:
+            pass
+    safe_send(chat_id, text)
 
 def pk(props, name):
     return deps["find_prop_key"](props, name)
@@ -48,8 +59,9 @@ def handle_switch_on(chat_id, keyword):
 
     pid, title, props = matches[0]
 
-    msg = send(chat_id, f"🔄 Đang bật ON cho {title} ...")
-    mid = msg.get("result", {}).get("message_id")
+    msg = safe_send(chat_id, f"🔄 Đang bật ON cho {title} ...")
+    mid = extract_mid(msg)
+
 
     # ===== SNAPSHOT for UNDO =====
     snapshot = {}
