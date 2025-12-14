@@ -23,7 +23,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from flask import Flask, request, jsonify
 # ===== Switch ON/OFF plugin =====
-import switch_app
 
 # ------------- CONFIG -------------
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
@@ -2257,25 +2256,6 @@ def sweep_pending_expirations():
         time.sleep(5)
 
 threading.Thread(target=sweep_pending_expirations, daemon=True).start()
-# ===== Init switch_app dependencies =====
-switch_app.init_switch_deps(
-    send_telegram=send_telegram,
-    edit_telegram_message=edit_telegram_message,
-    find_target_matches=find_target_matches,
-    extract_prop_text=extract_prop_text,
-    parse_money_from_text=parse_money_from_text,
-    create_page_in_db=create_page_in_db,
-    archive_page=archive_page,
-    unarchive_page=unarchive_page,
-    update_page_properties=update_page_properties,
-    create_lai_page=create_lai_page,
-    query_database_all=query_database_all,
-    undo_stack=undo_stack,
-    get_page=get_page,
-    NOTION_DATABASE_ID=NOTION_DATABASE_ID,
-    find_prop_key=find_prop_key,
-)
-
 # ------------- FLASK APP / WEBHOOK -------------
 app = Flask(__name__)
 
