@@ -22,12 +22,8 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from flask import Flask, request, jsonify
-# === SWITCH ON / OFF EXTENSION ===
-from switch_app import (
-    handle_switch_on,
-    handle_switch_off,
-    undo_switch,
-)
+# ===== Switch ON/OFF plugin =====
+import switch_app
 
 # ------------- CONFIG -------------
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
@@ -1651,25 +1647,20 @@ def handle_incoming_message(chat_id: int, text: str):
         # --- PHÂN TÍCH LỆNH ---
         keyword, count, action = parse_user_command(raw)
         kw = keyword  # giữ lại cho auto-mark
-        # ===============================
-        # SWITCH ON / OFF (EXTENSION)
-        # ===============================
+        # ===== SWITCH ON / OFF =====
         low_raw = raw.strip().lower()
 
-        # gxxx on
         if low_raw.endswith(" on"):
-            # chạy song song, không block webhook
             threading.Thread(
-                target=handle_switch_on,
+                target=switch_app.handle_switch_on,
                 args=(chat_id, kw),
                 daemon=True
             ).start()
             return
 
-        # gxxx off
         if low_raw.endswith(" off"):
             threading.Thread(
-                target=handle_switch_off,
+                target=switch_app.handle_switch_off,
                 args=(chat_id, kw),
                 daemon=True
             ).start()
@@ -1999,6 +1990,23 @@ def sweep_pending_expirations():
         time.sleep(5)
 
 threading.Thread(target=sweep_pending_expirations, daemon=True).start()
+# ===== Init switch_app dependencies =====
+switch_app.init_switch_deps(
+    send_telegram=send_telegram,
+    edit_telegram_message=edit_telegram_message,
+    find_target_matches=find_target_matches,
+    extract_prop_text=extract_prop_text,
+    parse_money_from_text=parse_money_from_text,
+    create_page_in_db=create_page_in_db,
+    archive_page=archive_page,
+    unarchive_page=unarchive_page,
+    update_page_properties=update_page_properties,
+    create_lai_page=create_lai_page,
+    query_database_all=query_database_all,
+    undo_stack=undo_stack,
+    NOTION_DATABASE_ID=NOTION_DATABASE_ID,
+    find_prop_key=find_prop_key,
+)
 
 # ------------- FLASK APP / WEBHOOK -------------
 app = Flask(__name__)
@@ -2073,6 +2081,30 @@ def auto_ping_render():
 
         # đợi 5 phút rồi ping lại
         time.sleep(300)  # 30780s = 13 phút
+def daily_ping_1355_vn():
+    """
+    Vào lúc 13:55 theo múi giờ VN (UTC+7) gửi GET tới remind-service.
+    Chạy liên tục trong background thread (daemon).
+    """
+    last_ping_date = None  # YYYY-MM-DD string của lần ping gần nhất
+    while True:
+        now_vn = datetime.now(VN_TZ)
+        today_str = now_vn.date().isoformat()
+        # Kiểm tra điều kiện: đúng 13:55 và chưa ping hôm nay
+        if now_vn.hour == 13 and now_vn.minute == 55 and last_ping_date != today_str:
+            try:
+                resp = requests.get("https://remind-service.onrender.com", timeout=10)
+                print(f"[DAILY PING] {datetime.now().isoformat()} -> {resp.status_code}")
+            except Exception as e:
+                print(f"[DAILY PING ERROR] {datetime.now().isoformat()} -> {e}")
+            # đánh dấu đã ping hôm nay
+            last_ping_date = today_str
+            # chờ đến sau phút 13:55 để tránh ping lại trong cùng phút
+            time.sleep(65)
+
+        # nếu đã qua 13:56 VN và last_ping_date là hôm qua (hoặc None) thì giữ nguyên;
+        # ngủ ngắn để giảm CPU
+        time.sleep(15)
 
 # Start the background thread as daemon so nó chạy cùng process app
 threading.Thread(target=daily_ping_1355_vn, daemon=True).start()
