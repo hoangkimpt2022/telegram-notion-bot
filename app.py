@@ -459,6 +459,9 @@ def handle_switch_on(chat_id: int, keyword: str):
             return
 
         page_id, title, _ = matches[0]
+        page = get_page(page_id)
+        props = page["properties"]
+
 
         # get full page props (must be full properties for find_prop_key to work)
         page = get_page(page_id)
@@ -595,7 +598,7 @@ def handle_switch_on(chat_id: int, keyword: str):
     except Exception as e:
         traceback.print_exc()
         _safe_edit(chat_id, None, f"❌ Lỗi khi bật ON: {e}")
-        
+
 def handle_switch_off(chat_id: int, keyword: str):
     try:
         matches = find_target_matches(keyword)
@@ -604,6 +607,8 @@ def handle_switch_off(chat_id: int, keyword: str):
             return
 
         page_id, title, _ = matches[0]
+        page = get_page(page_id)
+        props = page["properties"]
 
         # get full page
         page = get_page(page_id)
