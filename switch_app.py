@@ -45,14 +45,36 @@ def _now_vn_date():
 # NOTION HELPERS (CRITICAL)
 # =========================================================
 def _get_full_page(page_id: str) -> Dict[str, Any]:
-    """ EXACTLY like app.py """
-    r = requests.get(
+    """
+    Retrieve the full Notion page. Build headers safely from injected deps or env.
+    Falls back gracefully and raises a clear Exception if NOTION token missing.
+    """
+    # build headers: priority deps["NOTION_HEADERS"] -> construct from token/version
+    headers = deps.get("NOTION_HEADERS")
+    if not headers:
+        token = deps.get("NOTION_TOKEN") or os.getenv("NOTION_TOKEN")
+        if not token:
+            # try to notify user via telegram if possible, then raise
+            try:
+                _safe_send(None, "❌ Missing NOTION_TOKEN for switch_app — cannot access Notion API.")
+            except Exception:
+                pass
+            raise RuntimeError("Missing NOTION_TOKEN (env or injected).")
+        version = deps.get("NOTION_VERSION") or os.getenv("NOTION_VERSION") or "2022-06-28"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": version,
+            "Content-Type": "application/json"
+        }
+
+    # perform request (raise for status so caller sees HTTP errors)
+    resp = requests.get(
         f"https://api.notion.com/v1/pages/{page_id}",
-        headers=deps["NOTION_HEADERS"],
+        headers=headers,
         timeout=15
     )
-    r.raise_for_status()
-    return r.json()
+    resp.raise_for_status()
+    return resp.json()
 
 def _relation_page_id(kind: str) -> Optional[str]:
     if kind == "Thụ động":
@@ -71,7 +93,8 @@ def handle_switch_on(chat_id: int, keyword: str):
             return _safe_send(chat_id, f"❌ Không tìm thấy {keyword}")
 
         page_id, title, _ = matches[0]
-
+        page = deps["get_page"](page_id)
+        props = page.get("properties", {})
         # 🔴 GET FULL PAGE (ROOT FIX)
         page = _get_full_page(page_id)
         props = page["properties"]
