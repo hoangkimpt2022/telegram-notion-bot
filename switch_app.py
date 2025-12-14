@@ -163,6 +163,13 @@ def handle_switch_on(chat_id: Optional[int], keyword: str):
 
     page_id, title, props = matches[0]
     props = props or {}
+    
+    # ===== FIX: RESOLVE PROPERTY_ID FROM PROPS (CRITICAL) =====
+    status_key   = deps["find_prop_key"](props, "trạng thái")
+    ngay_dao_key = deps["find_prop_key"](props, "Ngày Đáo")
+    ngay_xong_key = deps["find_prop_key"](props, "ngày xong")
+    qdt_key      = deps["find_prop_key"](props, "Tổng Quan Đầu Tư")
+    ttd_key      = deps["find_prop_key"](props, "Tổng Thụ Động")
 
     # initial message (guaranteed to appear)
     m = _safe_send(chat_id, f"🔄 Đang bật ON cho {title} ...")
@@ -180,10 +187,13 @@ def handle_switch_on(chat_id: Optional[int], keyword: str):
     g_pid = _relation_page_id("G")
 
     # prepare update payload (do not clear relations if not provided; but if env missing, set empty relation and warn)
-    upd: Dict[str, Any] = {
-        _find_prop_key(props, "trạng thái"): {"select": {"name": "In progress"}},
-        _find_prop_key(props, "Ngày Đáo"): {"date": {"start": _now_vn_date()}},
-    }
+    update_page(page_id, {
+        status_key: {"select": {"name": "In progress"}},
+        ngay_dao_key: {"date": {"start": _now_vn_date()}},
+        qdt_key: {"relation": [{"id": _relation_page_id("Thụ động")}]},
+        ttd_key: {"relation": [{"id": _relation_page_id("G")}]},
+    })
+
 
     if qdt_pid:
         upd[_find_prop_key(props, "Tổng Quan Đầu Tư")] = {"relation": [{"id": qdt_pid}]}
@@ -319,6 +329,13 @@ def handle_switch_off(chat_id: Optional[int], keyword: str):
     page_id, title, props = matches[0]
     props = props or {}
 
+    # ===== FIX: RESOLVE PROPERTY_ID FROM PROPS (CRITICAL) =====
+    status_key   = deps["find_prop_key"](props, "trạng thái")
+    ngay_dao_key = deps["find_prop_key"](props, "Ngày Đáo")
+    ngay_xong_key = deps["find_prop_key"](props, "ngày xong")
+    qdt_key      = deps["find_prop_key"](props, "Tổng Quan Đầu Tư")
+    ttd_key      = deps["find_prop_key"](props, "Tổng Thụ Động")
+
     m = _safe_send(chat_id, f"⏳ Đang OFF {title} ...")
     mid = _extract_mid(m)
 
@@ -372,16 +389,33 @@ def handle_switch_off(chat_id: Optional[int], keyword: str):
             print("WARN create_lai_page:", e)
 
     # update target: Done, ngày xong = today, clear relations
+    # ================== CORE: OFF — UPDATE TARGET ==================
     try:
+        # 1️⃣ Resolve PROPERTY_ID (BẮT BUỘC)
+        status_key   = deps["find_prop_key"](props, "trạng thái")
+        ngay_xong_key = deps["find_prop_key"](props, "ngày xong")
+        qdt_key      = deps["find_prop_key"](props, "Tổng Quan Đầu Tư")
+        ttd_key      = deps["find_prop_key"](props, "Tổng Thụ Động")
+
+        # 2️⃣ Build payload bằng PROPERTY_ID (KHÔNG DÙNG TÊN CỘT)
         upd = {
-            _find_prop_key(props, "trạng thái"): {"select": {"name": "Done"}},
-            _find_prop_key(props, "ngày xong"): {"date": {"start": _now_vn_date()}},
-            _find_prop_key(props, "Tổng Quan Đầu Tư"): {"relation": []},
-            _find_prop_key(props, "Tổng Thụ Động"): {"relation": []},
+            status_key: {"select": {"name": "Done"}},
+            ngay_xong_key: {"date": {"start": _now_vn_date()}},
+            qdt_key: {"relation": []},   # clear Relation Thụ động
+            ttd_key: {"relation": []},   # clear Relation G
         }
+
+        # 3️⃣ Debug 1 lần (có thể xóa sau khi ổn)
+        print("DEBUG OFF PATCH PAYLOAD:", upd)
+
+        # 4️⃣ PATCH Notion
         update_page(page_id, upd)
+
     except Exception as e:
-        print("WARN update target off:", e)
+        print("❌ ERROR update target OFF:", e)
+        traceback.print_exc()
+    # ===============================================================
+
 
     # push undo record
     try:
