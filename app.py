@@ -22,6 +22,12 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from flask import Flask, request, jsonify
+# === SWITCH ON / OFF EXTENSION ===
+from switch_app import (
+    handle_switch_on,
+    handle_switch_off,
+    undo_switch,
+)
 
 # ------------- CONFIG -------------
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
@@ -1645,6 +1651,29 @@ def handle_incoming_message(chat_id: int, text: str):
         # --- PHÂN TÍCH LỆNH ---
         keyword, count, action = parse_user_command(raw)
         kw = keyword  # giữ lại cho auto-mark
+        # ===============================
+        # SWITCH ON / OFF (EXTENSION)
+        # ===============================
+        low_raw = raw.strip().lower()
+
+        # gxxx on
+        if low_raw.endswith(" on"):
+            # chạy song song, không block webhook
+            threading.Thread(
+                target=handle_switch_on,
+                args=(chat_id, kw),
+                daemon=True
+            ).start()
+            return
+
+        # gxxx off
+        if low_raw.endswith(" off"):
+            threading.Thread(
+                target=handle_switch_off,
+                args=(chat_id, kw),
+                daemon=True
+            ).start()
+            return
 
         # --- AUTO-MARK MODE ---
         if action == "mark" and count > 0:
@@ -1675,9 +1704,23 @@ def handle_incoming_message(chat_id: int, text: str):
 
         # --- UNDO ---
         if action == "undo":
-            send_telegram(chat_id, "♻️ Đang hoàn tác hành động gần nhất ...")
-            threading.Thread(target=undo_last, args=(chat_id, 1), daemon=True).start()
+        # ưu tiên undo ON / OFF nếu có
+        if undo_stack.get(str(chat_id)):
+            threading.Thread(
+                target=undo_switch,
+                args=(chat_id,),
+                daemon=True
+            ).start()
             return
+
+        # fallback undo cũ
+        send_telegram(chat_id, "♻️ Đang hoàn tác hành động gần nhất ...")
+        threading.Thread(
+            target=undo_last,
+            args=(chat_id, 1),
+            daemon=True
+        ).start()
+        return
 
         # 📦 ARCHIVE MODE — XÓA NGÀY CỤ THỂ (KHÔNG CHỒNG ANIMATION)
         if action == "archive":
