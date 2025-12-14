@@ -2004,6 +2004,7 @@ switch_app.init_switch_deps(
     create_lai_page=create_lai_page,
     query_database_all=query_database_all,
     undo_stack=undo_stack,
+    get_page=get_page,
     NOTION_DATABASE_ID=NOTION_DATABASE_ID,
     find_prop_key=find_prop_key,
 )
