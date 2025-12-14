@@ -131,28 +131,22 @@ def _parse_int_from_prop(props: Dict[str, Any], name_like: str, default: int = 0
 # ---------------- Core: ON ----------------
 def handle_switch_on(chat_id: Optional[int], keyword: str):
     """
-    ON flow:
-      - find target page in TARGET_NOTION_DATABASE_ID (first match)
-      - snapshot touched props for undo
-      - update target: trạng thái=In progress, Ngày Đáo=today, relations for Tổng Quan Đầu Tư and Tổng Thụ Động using SWITCH_* page ids
-      - create N pages in NOTION_DATABASE_ID for 'ngày trước' (Đã Góp = True, Lịch G relation)
-      - push undo record into deps['undo_stack'][str(chat_id)]
-      - provide animated Telegram feedback and final report matching your requested format
+    Robust, fixed handle_switch_on:
+    - Resolves PROPERTY IDs first
+    - Builds `upd` payload before any reference to it
+    - Uses safe_send/safe_edit helpers to avoid thread crash
+    - Creates day pages and pushes undo record to deps['undo_stack']
     """
-    # validate deps
+    # Validate dependencies (fail fast if missing)
     try:
         send = deps["send_telegram"]
         find_matches = deps["find_target_matches"]
-        extract = deps["extract_prop_text"]
-        parse_money = deps.get("parse_money_from_text")
         create_page = deps["create_page_in_db"]
         update_page = deps["update_page_properties"]
         undo_stack = deps["undo_stack"]
-        query_calendar = deps["query_database_all"]
         find_prop_key = deps["find_prop_key"]
         NOTION_DB = deps["NOTION_DATABASE_ID"]
     except Exception as e:
-        # required dependency missing
         print("handle_switch_on missing deps:", e)
         return
 
@@ -163,74 +157,67 @@ def handle_switch_on(chat_id: Optional[int], keyword: str):
 
     page_id, title, props = matches[0]
     props = props or {}
-    
-    # ===== FIX: RESOLVE PROPERTY_ID FROM PROPS (CRITICAL) =====
-    status_key   = deps["find_prop_key"](props, "trạng thái")
-    ngay_dao_key = deps["find_prop_key"](props, "Ngày Đáo")
-    ngay_xong_key = deps["find_prop_key"](props, "ngày xong")
-    qdt_key      = deps["find_prop_key"](props, "Tổng Quan Đầu Tư")
-    ttd_key      = deps["find_prop_key"](props, "Tổng Thụ Động")
 
-    # initial message (guaranteed to appear)
+    # send initial message and get message_id safely
     m = _safe_send(chat_id, f"🔄 Đang bật ON cho {title} ...")
     mid = _extract_mid(m)
 
-    # snapshot properties we will touch
-    snapshot: Dict[str, Any] = {}
-    for name in ("trạng thái", "Ngày Đáo", "Tổng Quan Đầu Tư", "Tổng Thụ Động", "ngày xong"):
-        key = _find_prop_key(props, name)
-        if key in props:
-            snapshot[key] = props[key]
+    # ===== RESOLVE PROPERTY_IDs (must do this BEFORE building upd) =====
+    try:
+        status_key    = _find_prop_key(props, "trạng thái")
+        ngay_dao_key  = _find_prop_key(props, "Ngày Đáo")
+        ngay_xong_key = _find_prop_key(props, "ngày xong")
+        qdt_key       = _find_prop_key(props, "Tổng Quan Đầu Tư")
+        ttd_key       = _find_prop_key(props, "Tổng Thụ Động")
+    except Exception as e:
+        print("ERROR resolving property keys:", e)
+        _safe_edit(chat_id, mid, "❌ Lỗi nội bộ: không thể đọc cấu trúc trang Notion.")
+        return
 
-    # resolve relation page ids (must come from env or injected deps)
+    # ===== Resolve relation page ids from env/deps =====
     qdt_pid = _relation_page_id("Thụ động")
-    g_pid = _relation_page_id("G")
+    g_pid   = _relation_page_id("G")
 
-    # prepare update payload (do not clear relations if not provided; but if env missing, set empty relation and warn)
-    update_page(page_id, {
+    # ===== BUILD upd PAYLOAD (define upd BEFORE use) =====
+    upd: Dict[str, Any] = {
         status_key: {"select": {"name": "In progress"}},
         ngay_dao_key: {"date": {"start": _now_vn_date()}},
-        qdt_key: {"relation": [{"id": _relation_page_id("Thụ động")}]},
-        ttd_key: {"relation": [{"id": _relation_page_id("G")}]},
-    })
+    }
 
-
+    # include relation only if resolved; otherwise set explicit empty relation and warn
     if qdt_pid:
-        upd[_find_prop_key(props, "Tổng Quan Đầu Tư")] = {"relation": [{"id": qdt_pid}]}
+        upd[qdt_key] = {"relation": [{"id": qdt_pid}]}
     else:
-        # warn user once but continue
-        _safe_send(chat_id, "⚠️ Warning: SWITCH_QDT_PAGE_ID not set — 'Tổng Quan Đầu Tư' not linked.")
-        upd[_find_prop_key(props, "Tổng Quan Đầu Tư")] = {"relation": []}
+        _safe_send(chat_id, "⚠️ Warning: SWITCH_QDT_PAGE_ID not set — 'Tổng Quan Đầu Tư' không được link.")
+        upd[qdt_key] = {"relation": []}
 
     if g_pid:
-        upd[_find_prop_key(props, "Tổng Thụ Động")] = {"relation": [{"id": g_pid}]}
+        upd[ttd_key] = {"relation": [{"id": g_pid}]}
     else:
-        _safe_send(chat_id, "⚠️ Warning: SWITCH_TTD_PAGE_ID not set — 'Tổng Thụ Động' not linked.")
-        upd[_find_prop_key(props, "Tổng Thụ Động")] = {"relation": []}
+        _safe_send(chat_id, "⚠️ Warning: SWITCH_TTD_PAGE_ID not set — 'Tổng Thụ Động' không được link.")
+        upd[ttd_key] = {"relation": []}
 
-    # apply update
+    # optional debug
+    # print("DEBUG ON PATCH PAYLOAD:", upd)
+
+    # ===== APPLY update (single PATCH) =====
     try:
         update_page(page_id, upd)
     except Exception as e:
         print("WARN update target on:", e)
+        _safe_edit(chat_id, mid, "⚠️ Cảnh báo: không thể cập nhật trang mục tiêu. Tiếp tục tạo ngày nếu có.")
 
     _safe_edit(chat_id, mid, "⚙️ Đã cập nhật trạng thái & Ngày Đáo. Đang tạo ngày (nếu có)...")
 
-    # read fields exactly as specified
-    # tiền -> "tiền"
+    # ===== READ FIELDS (strict mapping) =====
     total_money = _parse_int_from_prop(props, "tiền", default=0)
-    # G ngày -> "G ngày"
-    per_day = _parse_int_from_prop(props, "G ngày", default=0)
-    # tổng ngày g -> "tổng ngày g" (the 'góp' value)
-    total_gop = _parse_int_from_prop(props, "tổng ngày g", default=0)
-    # ngày trước -> number of days to create
-    take_days = _parse_int_from_prop(props, "ngày trước", default=0)
-    # 'trước' formula (read as-is)
-    truoc_val = _parse_int_from_prop(props, "trước", default=0)
-    # CK formula (read as-is)
-    ck_val = _parse_int_from_prop(props, "CK", default=0)
+    per_day     = _parse_int_from_prop(props, "G ngày", default=0)
+    total_gop   = _parse_int_from_prop(props, "tổng ngày g", default=0)
+    take_days   = _parse_int_from_prop(props, "ngày trước", default=0)
+    truoc_val   = _parse_int_from_prop(props, "trước", default=0)
+    ck_val      = _parse_int_from_prop(props, "CK", default=0)
 
-    # create day pages: count = take_days, each with per_day
+    # ===== CREATE day pages =====
     created_pages: List[str] = []
     start_date = datetime.now(VN_TZ).date()
     for i in range(take_days):
@@ -243,7 +230,6 @@ def handle_switch_on(chat_id: Optional[int], keyword: str):
             "Lịch G": {"relation": [{"id": page_id}]},
         }
         try:
-            # create_page may return (ok, res) or created page dict; handle both
             res = create_page(NOTION_DB, page_payload)
             created_id = None
             if isinstance(res, tuple) and len(res) >= 2:
@@ -252,32 +238,26 @@ def handle_switch_on(chat_id: Optional[int], keyword: str):
                     created_id = body.get("id")
             elif isinstance(res, dict) and res.get("id"):
                 created_id = res.get("id")
-            # append if we got an id
             if created_id:
                 created_pages.append(created_id)
         except Exception as e:
             print("WARN create day page:", e)
 
-        # animated progress update
-        try:
-            _safe_edit(chat_id, mid, f"📆 {i+1}/{max(1, take_days)} — {d.isoformat()}")
-        except Exception:
-            pass
+        _safe_edit(chat_id, mid, f"📆 {i+1}/{max(1, take_days)} — {d.isoformat()}")
         time.sleep(0.12)
 
-    # push undo record to app's undo_stack (compatibility)
+    # ===== PUSH UNDO =====
     try:
         undo_stack.setdefault(str(chat_id), []).append({
             "action": "switch_on",
             "target_id": page_id,
-            "snapshot": snapshot,
+            "snapshot": {k: props.get(k) for k in (status_key, ngay_dao_key, qdt_key, ttd_key, ngay_xong_key)},
             "created_pages": created_pages,
         })
     except Exception:
-        # fallback: store locally if deps doesn't provide undo_stack (shouldn't happen)
         print("WARN: unable to push into undo_stack")
 
-    # build final message exactly per spec
+    # ===== FINAL REPORT =====
     lines: List[str] = []
     lines.append(f"🔔 Đã bật ON cho: {title}")
     lines.append(f"với số tiền {total_money:,} ngày {per_day:,} góp {total_gop} ngày")
@@ -291,7 +271,6 @@ def handle_switch_on(chat_id: Optional[int], keyword: str):
     lines.append("")
     lines.append("🎉 Hoàn tất ON.")
     _safe_edit(chat_id, mid, "\n".join(lines))
-
 
 # ---------------- Core: OFF ----------------
 def handle_switch_off(chat_id: Optional[int], keyword: str):
