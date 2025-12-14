@@ -1,327 +1,444 @@
-#!/usr/bin/env python3
-# remind_v1.py — warm-run on start, then daily schedule
-# Env required:
-#   NOTION_TOKEN
-#   REMIND_NOTION_DATABASE_   (database id)
-#   TELEGRAM_TOKEN
-#   TELEGRAM_CHAT_ID (số)
-# Optional:
-#   TIMEZONE (default Asia/Ho_Chi_Minh)
-#   REMIND_HOUR (default 14)
-#   REMIND_MINUTE (default 0)
-#   NO_TASK_MESSAGE (default Vietnamese friendly message)
+# switch_app.py
+# Extension module for app.py (do NOT modify app.py)
+# Place this file alongside app.py on your Render service.
+#
+# Exports three functions to be called from app.py or other modules:
+#   handle_switch_on(chat_id: int, keyword: str)
+#   handle_switch_off(chat_id: int, keyword: str)
+#   undo_switch(chat_id: int)
+#
+# Requirements: app.py must expose the following names:
+# send_telegram, edit_telegram_message, find_target_matches, extract_prop_text,
+# parse_money_from_text, create_page_in_db, archive_page, unarchive_page,
+# update_page_properties, create_lai_page, query_database_all, undo_stack,
+# NOTION_DATABASE_ID, find_prop_key
+#
+# The code below is defensive about missing fields and logs errors to Telegram.
 
-import os
-import requests
-import datetime
-import pytz
-import traceback
 import time
-from dateutil import parser as dateparser
-from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, List, Optional
 
-# --- Config from env ---
-NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
-REMIND_DB = os.getenv("REMIND_NOTION_DATABASE", "").strip()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# Import utilities and shared state from app.py
+from app import (
+    send_telegram,
+    edit_telegram_message,
+    find_target_matches,
+    extract_prop_text,
+    parse_money_from_text,
+    create_page_in_db,
+    archive_page,
+    unarchive_page,
+    update_page_properties,
+    create_lai_page,
+    query_database_all,
+    undo_stack,
+    NOTION_DATABASE_ID,
+    find_prop_key,
+)
 
-TIMEZONE = os.getenv("TIMEZONE", "Asia/Ho_Chi_Minh")
-try:
-    REMIND_HOUR = int(os.getenv("REMIND_HOUR", "14"))
-    REMIND_MINUTE = int(os.getenv("REMIND_MINUTE", "0"))
-except Exception:
-    REMIND_HOUR, REMIND_MINUTE = 14, 0
 
-NO_TASK_MESSAGE = os.getenv("NO_TASK_MESSAGE",
-                            "Hôm nay không có việc cần làm — chúc sếp hôm nay vui vẻ!")
-NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
+VN_TZ = timezone(timedelta(hours=7))
 
-HEADERS = {
-    "Authorization": f"Bearer {NOTION_TOKEN}" if NOTION_TOKEN else "",
-    "Notion-Version": NOTION_VERSION,
-    "Content-Type": "application/json",
-}
 
-LAST_REMIND_PROP_CANDIDATES = [
-    "Last reminded at",
-    "Last reminded time",
-    "Last reminded",
-    "Last edited time",
-    "Last reminded time (auto)"
-]
+# -----------------------
+# Helpers: snapshot/restore
+# -----------------------
+def snapshot_target_props(props: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a snapshot mapping of the target page's properties that we will change.
+    The snapshot stores the actual property objects from Notion (so they can be PATCHed back).
+    """
+    keys_like = [
+        "trạng thái",
+        "Tổng Quan Đầu Tư",
+        "Tổng Thụ Động",
+        "Ngày Đáo",
+        "ngày xong",
+    ]
+    snap = {}
+    if not props:
+        return snap
+    for kl in keys_like:
+        actual = find_prop_key(props, kl)
+        if actual and actual in props:
+            snap[actual] = props[actual]
+    return snap
 
-# ---------- Helpers ----------
-def log(*args, **kwargs):
+
+def restore_target_snapshot(page_id: str, snapshot: Dict[str, Any]) -> None:
+    """
+    Restore a previously-saved snapshot. snapshot keys must be the property names (as present in DB).
+    """
+    if not snapshot:
+        return
     try:
-        ts = datetime.datetime.now(pytz.timezone(TIMEZONE)).isoformat()
+        update_page_properties(page_id, snapshot)
+    except Exception as e:
+        # best-effort: notify but continue
+        try:
+            send_telegram("", f"⚠️ restore_target_snapshot error: {e}")
+        except:
+            pass
+
+
+def safe_edit(chat_id: int, message_id: Optional[int], text: str) -> None:
+    """Helper that falls back to send_telegram if edit fails."""
+    try:
+        if message_id:
+            edit_telegram_message(chat_id, message_id, text)
+            return
     except Exception:
-        ts = datetime.datetime.utcnow().isoformat()
-    print(ts, *args, **kwargs)
+        pass
+    send_telegram(chat_id, text)
 
-def notion_post(path, json_payload, timeout=20):
-    url = f"https://api.notion.com/v1{path}"
-    r = requests.post(url, headers=HEADERS, json=json_payload, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
 
-def notion_patch(path, json_payload, timeout=12):
-    url = f"https://api.notion.com/v1{path}"
-    r = requests.patch(url, headers=HEADERS, json=json_payload, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
-
-def extract_plain_text(arr):
-    if not arr:
-        return ""
-    return "".join([it.get("plain_text", "") for it in arr if isinstance(it, dict)])
-
-def get_title_from_page(page):
-    props = page.get("properties", {})
-    for key, val in props.items():
-        if val.get("type") == "title":
-            return extract_plain_text(val.get("title", []))
-    v = props.get("name") or props.get("Name")
-    if isinstance(v, dict) and v.get("type") in ("title", "rich_text"):
-        return extract_plain_text(v.get(v.get("type", ""), []))
-    return page.get("id", "")[:8]
-
-def get_note_from_page(page):
-    props = page.get("properties", {})
-    for k, v in props.items():
-        key_lower = k.lower()
-        if key_lower in ("note", "ghi chú", "ghi_chu", "note_text", "description"):
-            t = v.get("type")
-            if t == "rich_text":
-                return extract_plain_text(v.get("rich_text", []))
-            if t == "title":
-                return extract_plain_text(v.get("title", []))
-    for k, v in props.items():
-        if v.get("type") == "rich_text":
-            s = extract_plain_text(v.get("rich_text", []))
-            if s:
-                return s
-    return ""
-
-def find_date_property(page):
-    props = page.get("properties", {})
-    for k, v in props.items():
-        if v.get("type") == "date":
-            return k, v
-    for k, v in props.items():
-        if "ngày" in k.lower() or "date" in k.lower() or "due" in k.lower() or "deadline" in k.lower():
-            if v.get("type") in ("date", "rich_text", "title"):
-                return k, v
-    return None, None
-
-def parse_notion_date(date_obj):
-    if not date_obj:
-        return None
-    if isinstance(date_obj, dict):
-        start = date_obj.get("start")
-        if not start:
-            return None
-        try:
-            return dateparser.isoparse(start)
-        except Exception:
-            try:
-                return dateparser.parse(start)
-            except Exception:
-                return None
-    return None
-
-def notion_query_active_not_done(page_size=100):
-    if not NOTION_TOKEN or not REMIND_DB:
-        log("Missing NOTION_TOKEN or REMIND_NOTION_DATABASE_ env")
-        return []
-    payload = {
-        "filter": {
-            "and": [
-                {"property": "active", "checkbox": {"equals": True}},
-                {"property": "Done", "checkbox": {"equals": False}}
-            ]
-        },
-        "page_size": page_size
-    }
+# -----------------------
+# SWITCH ON implementation
+# -----------------------
+def handle_switch_on(chat_id: int, keyword: str) -> None:
+    """
+    ON:
+      - find target in TARGET_NOTION_DATABASE_ID (via find_target_matches)
+      - snapshot target properties
+      - set target properties:
+          trạng thái = In progress
+          Tổng Quan Đầu Tư = Thụ động
+          Tổng Thụ Động = G
+          Ngày Đáo = today (VN)
+      - read "ngày trước" (N)
+      - create N pages in NOTION_DATABASE_ID:
+          Name, Ngày Góp (today + i), Tiền = G ngày, Đã Góp = True, Lịch G = relation -> target
+      - push undo log to undo_stack[chat_id]
+      - animate progress in Telegram (single editable message)
+    """
     try:
-        res = notion_post(f"/databases/{REMIND_DB}/query", payload)
-        return res.get("results", [])
+        matches = find_target_matches(keyword)
     except Exception as e:
-        log("Primary query failed (maybe property names differ). Error:", e)
-        try:
-            fb = {"page_size": page_size}
-            res2 = notion_post(f"/databases/{REMIND_DB}/query", fb)
-            return res2.get("results", [])
-        except Exception as ex:
-            log("Fallback query failed:", ex)
-            return []
+        send_telegram(chat_id, f"❌ Lỗi tìm target: {e}")
+        return
 
-def is_due_today_or_overdue(page):
-    tz = pytz.timezone(TIMEZONE)
-    today = datetime.datetime.now(tz).date()
-    prop_name, prop_value = find_date_property(page)
-    if not prop_name:
-        return False, None, None
-    p = page.get("properties", {}).get(prop_name, {})
-    date_field = None
-    if isinstance(p, dict) and p.get("type") == "date":
-        date_field = p.get("date")
-    dt = parse_notion_date(date_field)
-    if not dt:
-        return False, None, None
-    if dt.tzinfo is None:
-        dt = tz.localize(dt)
-    local_date = dt.astimezone(tz).date()
-    if local_date <= today:
-        status = "overdue" if local_date < today else "due_today"
-        return True, status, local_date
-    return False, None, local_date
+    if not matches:
+        send_telegram(chat_id, f"❌ Không tìm thấy target '{keyword}'")
+        return
 
-def update_last_reminded_if_exists(page_id):
-    now_iso = datetime.datetime.now(pytz.timezone(TIMEZONE)).isoformat()
-    for prop in LAST_REMIND_PROP_CANDIDATES:
-        body = {"properties": {prop: {"date": {"start": now_iso}}}}
+    # pick first match
+    page_id, title, props = matches[0]
+
+    # start animation message
+    m = send_telegram(chat_id, f"🔄 Bật ON cho {title} ...")
+    mid = m.get("result", {}).get("message_id")
+
+    def update(txt: str):
+        safe_edit(chat_id, mid, txt)
+
+    # snapshot
+    snapshot = snapshot_target_props(props)
+
+    # prepare property names (use actual property keys if possible)
+    # fallback to literal name if find_prop_key not found
+    def prop_key(name_like: str) -> str:
+        k = find_prop_key(props, name_like)
+        return k if k else name_like
+
+    try:
+        # TODAY in VN timezone
+        today = datetime.now(VN_TZ).date().isoformat()
+
+        # update target props
+        update_page_properties(
+            page_id,
+            {
+                prop_key("trạng thái"): {"select": {"name": "In progress"}},
+                prop_key("Tổng Quan Đầu Tư"): {"select": {"name": "Thụ động"}},
+                prop_key("Tổng Thụ Động"): {"select": {"name": "G"}},
+                prop_key("Ngày Đáo"): {"date": {"start": today}},
+            },
+        )
+        update("⚙️ Đã cập nhật trạng thái, đang chuẩn bị tạo ngày ...")
+        time.sleep(0.25)
+    except Exception as e:
+        update(f"❌ Lỗi khi cập nhật target: {e}")
+        return
+
+    # read days and per_day
+    try:
+        raw_days = extract_prop_text(props, "ngày trước") or ""
         try:
-            notion_patch(f"/pages/{page_id}", body)
-            return True
+            days = int(float(raw_days))
+            if days < 0:
+                days = 0
         except Exception:
+            days = 0
+        per_day_val = parse_money_from_text(extract_prop_text(props, "G ngày") or "")
+    except Exception:
+        days = 0
+        per_day_val = 0
+
+    created_pages: List[str] = []
+    start_date = datetime.now(VN_TZ).date()
+
+    if days <= 0:
+        update("ℹ️ 'ngày trước' = 0 -> không tạo ngày. Hoàn tất ON.")
+        # still record undo (snapshot only, no created pages) so undo will restore original props
+        undo_stack.setdefault(str(chat_id), []).append(
+            {
+                "action": "switch_on",
+                "target_id": page_id,
+                "snapshot": snapshot,
+                "created_pages": created_pages,
+                "timestamp": datetime.now(VN_TZ).isoformat(),
+            }
+        )
+        return
+
+    update(f"📅 Bắt đầu tạo {days} ngày (Đã Góp = True) ...")
+    for i in range(days):
+        d = start_date + timedelta(days=i)
+        props_payload = {
+            "Name": {"title": [{"type": "text", "text": {"content": title}}]},
+            "Ngày Góp": {"date": {"start": d.isoformat()}},
+            "Tiền": {"number": per_day_val},
+            "Đã Góp": {"checkbox": True},
+            "Lịch G": {"relation": [{"id": page_id}]},
+        }
+        try:
+            ok, res = create_page_in_db(NOTION_DATABASE_ID, props_payload)
+            if ok and isinstance(res, dict):
+                new_id = res.get("id")
+                if new_id:
+                    created_pages.append(new_id)
+        except Exception as e:
+            # continue on error but report
+            update(f"⚠️ Lỗi tạo ngày {i+1}: {e}")
+
+        # progress bar
+        try:
+            pct = (i + 1) / days
+            bar = int(pct * 10)
+            if bar < 1 and days > 0:
+                bar = 1
+            bar_str = "█" * bar + "░" * (10 - bar)
+        except Exception:
+            bar_str = "██████████"
+
+        update(f"📆 Tạo ngày {i+1}/{days} [{bar_str}] — {d.isoformat()}")
+        time.sleep(0.25)
+
+    # push undo log
+    undo_stack.setdefault(str(chat_id), []).append(
+        {
+            "action": "switch_on",
+            "target_id": page_id,
+            "snapshot": snapshot,
+            "created_pages": created_pages,
+            "timestamp": datetime.now(VN_TZ).isoformat(),
+        }
+    )
+
+    update(f"✅ Đã bật ON cho {title} — Đã tạo {len(created_pages)} ngày.")
+
+
+# ------------------------
+# SWITCH OFF implementation
+# ------------------------
+def handle_switch_off(chat_id: int, keyword: str) -> None:
+    """
+    OFF:
+      - find target
+      - snapshot target
+      - find all day pages by relation "Lịch G" -> target
+      - archive all day pages
+      - create Lãi page in LA_NOTION_DATABASE_ID (via create_lai_page)
+      - update target:
+          trạng thái = Done
+          remove Tổng Quan Đầu Tư (clear select)
+          remove Tổng Thụ Động (clear select)
+          ngày xong = today (VN)
+      - push undo log with archived_pages and lai_page_id
+      - animate progress in Telegram (single editable message)
+    """
+    try:
+        matches = find_target_matches(keyword)
+    except Exception as e:
+        send_telegram(chat_id, f"❌ Lỗi tìm target: {e}")
+        return
+
+    if not matches:
+        send_telegram(chat_id, f"❌ Không tìm thấy target '{keyword}'")
+        return
+
+    page_id, title, props = matches[0]
+    m = send_telegram(chat_id, f"⏳ Đang OFF cho {title} ...")
+    mid = m.get("result", {}).get("message_id")
+
+    def update(txt: str):
+        safe_edit(chat_id, mid, txt)
+
+    snapshot = snapshot_target_props(props)
+
+    # find day pages in calendar DB that link to this target via relation "Lịch G"
+    try:
+        all_pages = query_database_all(NOTION_DATABASE_ID)
+    except Exception as e:
+        update(f"❌ Lỗi query calendar DB: {e}")
+        return
+
+    to_archive: List[str] = []
+    for p in all_pages:
+        props_p = p.get("properties", {}) or {}
+        rel_key = find_prop_key(props_p, "Lịch G")
+        if not rel_key:
             continue
-    return False
+        rel_arr = props_p.get(rel_key, {}).get("relation", []) or []
+        if any(r.get("id") == page_id for r in rel_arr):
+            to_archive.append(p.get("id"))
 
-# ---------- Telegram ----------
-def send_telegram(chat_id, text):
-    if not TELEGRAM_TOKEN or not chat_id:
-        log("Missing TELEGRAM_TOKEN or chat_id")
-        return False, None
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    total = len(to_archive)
+    if total == 0:
+        update("🧹 Không có ngày để xóa.")
+    else:
+        update(f"🧹 Bắt đầu xóa {total} ngày ...")
+        for idx, pid in enumerate(to_archive, start=1):
+            try:
+                archive_page(pid)
+            except Exception as e:
+                # continue but log
+                update(f"⚠️ Lỗi xóa ngày {idx}: {e}")
+
+            pct = idx / total if total else 1
+            bar = int(pct * 10)
+            if bar < 1 and total > 0:
+                bar = 1
+            bar_str = "█" * bar + "░" * (10 - bar)
+            update(f"🗑️ Xóa {idx}/{total} [{bar_str}]")
+            time.sleep(0.25)
+
+    # create lai page (if configured and value > 0)
+    lai_text = extract_prop_text(props, "Lai lịch g") or extract_prop_text(props, "Lãi") or extract_prop_text(props, "Lai") or ""
+    lai_amt = parse_money_from_text(lai_text) or 0
+    lai_page_id: Optional[str] = None
+    if lai_amt > 0:
+        try:
+            lai_page_id = create_lai_page(chat_id, title, lai_amt, page_id)
+            # create_lai_page sends its own telegram notification (consistent with app.py)
+        except Exception as e:
+            update(f"⚠️ Lỗi tạo Lãi: {e}")
+
+    # update target: Done + clear selects + set ngày xong
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        data = r.json() if r.content else {}
-        if r.status_code == 200 and data.get("ok"):
-            return True, data
-        return False, data
+        today = datetime.now(VN_TZ).date().isoformat()
+        # pick actual property names if available
+        def prop_key_local(name_like: str) -> str:
+            return find_prop_key(props, name_like) or name_like
+
+        update_page_properties(
+            page_id,
+            {
+                prop_key_local("trạng thái"): {"select": {"name": "Done"}},
+                prop_key_local("Tổng Quan Đầu Tư"): {"select": None},
+                prop_key_local("Tổng Thụ Động"): {"select": None},
+                prop_key_local("ngày xong"): {"date": {"start": today}},
+            },
+        )
     except Exception as e:
-        return False, str(e)
+        update(f"⚠️ Lỗi cập nhật target sau OFF: {e}")
 
-# ---------- Main job ----------
-def job_remind_once():
+    # log undo
+    undo_stack.setdefault(str(chat_id), []).append(
+        {
+            "action": "switch_off",
+            "target_id": page_id,
+            "snapshot": snapshot,
+            "archived_pages": to_archive,
+            "lai_page_id": lai_page_id,
+            "timestamp": datetime.now(VN_TZ).isoformat(),
+        }
+    )
+
+    update(f"✅ Đã OFF cho {title} — Đã xóa {total} ngày.")
+
+
+# ------------------------
+# UNDO for switch on/off
+# ------------------------
+def undo_switch(chat_id: int) -> None:
+    """
+    Undo the last switch_on / switch_off action for this chat_id.
+    - For switch_on: archive created pages, restore target snapshot
+    - For switch_off: unarchive archived pages, archive lai_page (if created), restore snapshot
+    """
+    stack = undo_stack.get(str(chat_id), [])
+    if not stack:
+        send_telegram(chat_id, "❌ Không có thao tác để undo")
+        return
+
+    log = stack.pop()
+    if not isinstance(log, dict):
+        send_telegram(chat_id, "⚠️ Undo log malformed")
+        return
+
+    action = log.get("action")
+    target_id = log.get("target_id")
+    snapshot = log.get("snapshot", {}) or {}
+
+    # attempt to restore snapshot first (best-effort)
     try:
-        log("Running remind job (warm or scheduled)...")
-        pages = notion_query_active_not_done(page_size=200)
-        if pages is None:
-            log("Query returned None")
-            pages = []
-        if not pages:
-            # Send NO TASK message
-            log("No pages found in query. Sending NO_TASK_MESSAGE.")
-            ok, resp = send_telegram(TELEGRAM_CHAT_ID, NO_TASK_MESSAGE)
-            if ok:
-                log("Sent NO_TASK_MESSAGE successfully.")
-            else:
-                log("Failed to send NO_TASK_MESSAGE:", resp)
-            return
+        if snapshot:
+            update_page_properties(target_id, snapshot)
+    except Exception as e:
+        send_telegram(chat_id, f"⚠️ Lỗi restore target: {e}")
 
-        due_pages = []
-        for p in pages:
-            props = p.get("properties", {})
-            active = None
-            done = None
-            if "active" in props and props["active"].get("type") == "checkbox":
-                active = props["active"].get("checkbox", None)
-            if "Done" in props and props["Done"].get("type") == "checkbox":
-                done = props["Done"].get("checkbox", None)
-            if active is not None and not active:
-                continue
-            if done is not None and done:
-                continue
-
-            ok, status, local_date = is_due_today_or_overdue(p)
-            if ok:
-                title = get_title_from_page(p)
-                note = get_note_from_page(p)
-                due_pages.append((p, title, status, local_date, note))
-
-        if not due_pages:
-            # No due task specifically today/overdue -> send friendly "no task" message
-            log("No tasks due today or overdue. Sending NO_TASK_MESSAGE.")
-            ok, resp = send_telegram(TELEGRAM_CHAT_ID, NO_TASK_MESSAGE)
-            if ok:
-                log("Sent NO_TASK_MESSAGE successfully.")
-            else:
-                log("Failed to send NO_TASK_MESSAGE:", resp)
-            return
-
-        tz = pytz.timezone(TIMEZONE)
-        today_str = datetime.datetime.now(tz).strftime("%Y-%m-%d")
-        header = f"🔔 <b>Có — {len(due_pages)} công việc hôm nay ({today_str})</b>\n\n"
-        lines = [header]
-        for idx, (p, title, status, local_date, note) in enumerate(due_pages, start=1):
-            if status == "overdue":
-                flag = "🔴 Quá hạn"
-            else:
-                flag = "⏳ Hạn hôm nay"
-            lines.append(f"• <b>{title}</b> — {flag}")
-            if note:
-                short = note.strip()
-                if len(short) > 300:
-                    short = short[:300] + "..."
-                lines.append(f"  ↳ {short}")
-            lines.append(f"  ↳ Ngày hoàn thành: {local_date.isoformat()}")
-            lines.append("")
-
-        message = "\n".join(lines)
-        ok, resp = send_telegram(TELEGRAM_CHAT_ID, message)
-        if ok:
-            log("Sent reminder message successfully. Count:", len(due_pages))
-            for p, title, status, local_date, note in due_pages:
+    if action == "switch_on":
+        created = log.get("created_pages", []) or []
+        total = len(created)
+        if total:
+            msg = send_telegram(chat_id, f"♻️ Đang undo ON — xóa {total} page vừa tạo ...")
+            mid = msg.get("result", {}).get("message_id")
+            for idx, pid in enumerate(created, start=1):
                 try:
-                    pid = p.get("id")
-                    updated = update_last_reminded_if_exists(pid)
-                    if updated:
-                        log("Updated last reminded for", title)
+                    archive_page(pid)
                 except Exception:
                     pass
-        else:
-            log("Failed to send reminder:", resp)
+                pct = idx / total
+                bar = int(pct * 10)
+                if bar < 1:
+                    bar = 1
+                bar_str = "█" * bar + "░" * (10 - bar)
+                safe_edit(chat_id, mid, f"♻️ Xóa {idx}/{total} [{bar_str}]")
+                time.sleep(0.25)
+        send_telegram(chat_id, "✅ Hoàn tác ON hoàn tất.")
 
-    except Exception as e:
-        log("Exception in job_remind_once:", e)
-        traceback.print_exc()
+    elif action == "switch_off":
+        archived = log.get("archived_pages", []) or []
+        lai_page_id = log.get("lai_page_id")
+        total = len(archived)
+        if total:
+            msg = send_telegram(chat_id, f"♻️ Đang undo OFF — phục hồi {total} ngày ...")
+            mid = msg.get("result", {}).get("message_id")
+            for idx, pid in enumerate(archived, start=1):
+                try:
+                    unarchive_page(pid)
+                except Exception:
+                    pass
+                pct = idx / total
+                bar = int(pct * 10)
+                if bar < 1:
+                    bar = 1
+                bar_str = "█" * bar + "░" * (10 - bar)
+                safe_edit(chat_id, mid, f"♻️ Phục hồi {idx}/{total} [{bar_str}]")
+                time.sleep(0.25)
+        # archive lai page created during OFF
+        if lai_page_id:
+            try:
+                archive_page(lai_page_id)
+            except Exception:
+                pass
+        send_telegram(chat_id, "✅ Hoàn tác OFF hoàn tất.")
 
-def start_scheduler():
-    tz = pytz.timezone(TIMEZONE)
-    sched = BackgroundScheduler(timezone=tz)
-    sched.add_job(job_remind_once, 'cron', hour=REMIND_HOUR, minute=REMIND_MINUTE)
-    sched.start()
-    log(f"Scheduler started — daily at {REMIND_HOUR:02d}:{REMIND_MINUTE:02d} {TIMEZONE}")
-    try:
-        while True:
-            time.sleep(30)
-    except (KeyboardInterrupt, SystemExit):
-        log("Scheduler stopping...")
+    else:
+        send_telegram(chat_id, "⚠️ Không có hành động switch trong log để undo")
 
-if __name__ == "__main__":
-    log("remind_v1 starting — timezone:", TIMEZONE)
 
-    # --- Warm-run: chạy job 1 lần khi khởi động ---
-    try:
-        job_remind_once()
-    except Exception as e:
-        log("Warm-run error:", e)
-        traceback.print_exc()
-
-    # --- TEST TELEGRAM DIRECT (debug) ---
-    try:
-        ok, resp = send_telegram(TELEGRAM_CHAT_ID, "TEST: Worker đang hoạt động")
-        if ok:
-            log("TEST TELEGRAM: OK")
-        else:
-            log("TEST TELEGRAM FAILED:", resp)
-    except Exception as e:
-        log("TEST TELEGRAM FAILED (exception):", e)
-        traceback.print_exc()
-
-    # --- BẮT ĐẦU LỊCH NHẮC ---
-    start_scheduler()
-
+# Exported names for convenience if imported with *
+__all__ = ["handle_switch_on", "handle_switch_off", "undo_switch"]
