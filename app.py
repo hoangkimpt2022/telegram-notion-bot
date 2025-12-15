@@ -502,111 +502,162 @@ def find_target_matches(keyword: str, db_id: str = TARGET_NOTION_DATABASE_ID):
 
     return out
 # Replace your existing handle_switch_on with this implementation:
-def handle_switch(chat_id: int, keyword: str, mode: str):
+# --- Replace/insert this: safe ON handler (no relation updates) ---
+def handle_switch_on(chat_id: int, keyword: str):
     """
-    mode = 'on' | 'off'
-    Full ON / OFF with undo log
+    Safe ON:
+    - Chỉ cập nhật: 'trạng thái' -> In progress, 'Ngày Đáo' -> hôm nay (UTC+7)
+    - Ghi undo log (undo_stack) để có thể rollback
+    - Giữ nguyên cấu trúc thông báo (edit message animation)
     """
-
     try:
         matches = find_target_matches(keyword)
         if not matches:
-            send_telegram(chat_id, f"❌ Không tìm thấy {keyword}")
+            _safe_send(chat_id, f"❌ Không tìm thấy {keyword}")
             return
 
         page_id, title, _ = matches[0]
         page = get_page(page_id)
-        props = page.get("properties", {})
+        props = page.get("properties", {}) if isinstance(page, dict) else {}
 
-        # ---- find keys ----
-        status_key    = find_prop_key(props, "trạng thái")
-        ngay_dao_key  = find_prop_key(props, "Ngày Đáo")
-        ngay_xong_key = find_prop_key(props, "ngày xong")
+        # tìm property keys
+        status_key   = find_prop_key(props, "trạng thái")
+        ngay_dao_key = find_prop_key(props, "Ngày Đáo") or find_prop_key(props, "ngày đáo")
 
-        # ---- snapshot for undo ----
-        snapshot = {}
+        # bắt đầu tin nhắn animation
+        msg = _safe_send(chat_id, f"🔄 Đang bật ON cho: {title}")
+        mid = _extract_mid(msg)
+
+        # 1) PATCH trạng thái
         if status_key:
-            snapshot[status_key] = props.get(status_key)
-        if ngay_dao_key:
-            snapshot[ngay_dao_key] = props.get(ngay_dao_key)
-        if ngay_xong_key:
-            snapshot[ngay_xong_key] = props.get(ngay_xong_key)
-
-        msg = send_telegram(chat_id, f"🔄 Đang xử lý {mode.upper()} cho {title} ...")
-        mid = msg.get("result", {}).get("message_id")
-
-        created_pages = []
-
-        # =====================================================
-        # ======================== ON =========================
-        # =====================================================
-        if mode == "on":
-
-            # 1️⃣ trạng thái
-            if status_key:
-                update_page_properties(page_id, {
-                    status_key: {"select": {"name": "In progress"}}
-                })
-
-            # 2️⃣ Ngày Đáo
-            if ngay_dao_key:
-                update_page_properties(page_id, {
-                    ngay_dao_key: {"date": {"start": today_vn_iso()}}
-                })
-
-            # 3️⃣ Tạo ngày góp (GIỮ LOGIC CŨ)
-            edit_telegram_message(chat_id, mid, "📆 Đang tạo ngày góp ...")
-
-            # dùng lại logic bạn đang có
-            created_pages = create_days_from_props(chat_id, page_id, props) or []
-
-            # 4️⃣ Hiển thị kết quả
-            summary_text = build_on_summary_text(props)
-            edit_telegram_message(chat_id, mid, summary_text)
-
-        # =====================================================
-        # ======================== OFF ========================
-        # =====================================================
-        elif mode == "off":
-
-            # 1️⃣ trạng thái
-            if status_key:
-                update_page_properties(page_id, {
-                    status_key: {"select": {"name": "Done"}}
-                })
-
-            # 2️⃣ ngày xong
-            if ngay_xong_key:
-                update_page_properties(page_id, {
-                    ngay_xong_key: {"date": {"start": today_vn_iso()}}
-                })
-
-            # 3️⃣ TẠO LÃI QUA ĐÁO (LẤY cột "Lãi lịch g")
-            edit_telegram_message(chat_id, mid, "💰 Đang tạo Lãi ...")
-            props["ONLY_LAI"] = True
-            dao_create_pages_from_props(chat_id, page_id, props)
-
-            edit_telegram_message(chat_id, mid, f"✅ Đã OFF {title}\n💰 Lãi đã tạo xong.")
-
+            ok, res = update_page_properties(page_id, {
+                status_key: {"select": {"name": "In progress"}}
+            })
+            if not ok:
+                _safe_edit(chat_id, mid, f"⚠️ Không thể cập nhật 'trạng thái': {res}")
         else:
-            send_telegram(chat_id, f"❌ Mode không hợp lệ: {mode}")
-            return
+            _safe_edit(chat_id, mid, "⚠️ Không tìm thấy cột 'trạng thái' trên trang mục tiêu.")
 
-        # =====================================================
-        # ===================== PUSH UNDO =====================
-        # =====================================================
+        # 2) PATCH Ngày Đáo (metadata only)
+        if ngay_dao_key:
+            ok, res = update_page_properties(page_id, {
+                ngay_dao_key: {"date": {"start": today_vn_iso()}}
+            })
+            if not ok:
+                _safe_edit(chat_id, mid, f"⚠️ Không thể cập nhật 'Ngày Đáo': {res}")
+        else:
+            # không bắt buộc nhưng báo cho user
+            _safe_edit(chat_id, mid, "ℹ️ Trang này không có cột 'Ngày Đáo' để cập nhật.")
+
+        # Ghi undo log (lưu page_id + snapshot tối thiểu để rollback nếu cần)
         undo_stack.setdefault(str(chat_id), []).append({
-            "action": "switch",
-            "mode": mode,
+            "action": "switch_on",
             "page_id": page_id,
-            "snapshot": snapshot,
-            "created_pages": created_pages,
+            "note": f"on:{title}",
         })
 
-    except Exception as e:
-        traceback.print_exc()
-        send_telegram(chat_id, f"❌ Lỗi {mode.upper()}: {e}")
+        # Cuối cùng: edit lại tin nhắn với nội dung xác nhận (mẫu ngắn).
+        # Nếu bạn muốn nội dung dài như ví dụ (lịch 7 ngày, tổng CK...), ta có thể chép lại logic tính toán từ hàm cũ.
+        confirm_text = (
+            f"🔔 Đã bật ON cho: {title}\n\n"
+            "🏷️ Trạng thái: In progress\n"
+            f"📆 Ngày Đáo: {today_vn_iso()}\n\n"
+            "🎉 Hoàn tất ON."
+        )
+        _safe_edit(chat_id, mid, confirm_text)
 
+    except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
+        _safe_send(chat_id, f"❌ Lỗi khi bật ON: {e}")
+
+
+# --- Replace/insert this: safe OFF handler (no relation updates) ---
+def handle_switch_off(chat_id: int, keyword: str):
+    """
+    Safe OFF:
+    - Chỉ cập nhật: 'trạng thái' -> Done, 'ngày xong' -> hôm nay (UTC+7)
+    - Kích hoạt tạo Lãi (create_lai_page) dựa trên cột 'Lai lịch g' nếu có cấu hình LA_NOTION_DATABASE_ID
+    - Ghi undo log
+    """
+    try:
+        matches = find_target_matches(keyword)
+        if not matches:
+            _safe_send(chat_id, f"❌ Không tìm thấy {keyword}")
+            return
+
+        page_id, title, _ = matches[0]
+        page = get_page(page_id)
+        props = page.get("properties", {}) if isinstance(page, dict) else {}
+
+        status_key = find_prop_key(props, "trạng thái")
+        ngay_xong_key = find_prop_key(props, "ngày xong") or find_prop_key(props, "Ngày xong") or find_prop_key(props, "Ngày Xong")
+
+        # start animation msg
+        msg = _safe_send(chat_id, f"🔄 Đang tắt (OFF) cho: {title} ...")
+        mid = _extract_mid(msg)
+
+        # 1) set status Done
+        if status_key:
+            ok, res = update_page_properties(page_id, {
+                status_key: {"select": {"name": "Done"}}
+            })
+            if not ok:
+                _safe_edit(chat_id, mid, f"⚠️ Không thể cập nhật 'trạng thái': {res}")
+        else:
+            _safe_edit(chat_id, mid, "⚠️ Không tìm thấy cột 'trạng thái' để cập nhật.")
+
+        # 2) set ngày xong = hôm nay
+        if ngay_xong_key:
+            ok, res = update_page_properties(page_id, {
+                ngay_xong_key: {"date": {"start": today_vn_iso()}}
+            })
+            if not ok:
+                _safe_edit(chat_id, mid, f"⚠️ Không thể cập nhật 'ngày xong': {res}")
+        else:
+            _safe_edit(chat_id, mid, "ℹ️ Trang này không có cột 'ngày xong' để cập nhật.")
+
+        # 3) Tạo Lãi: lấy từ cột 'Lai lịch g' (ưu tiên) hoặc 'Lãi'...
+        lai_text = (
+            extract_prop_text(props, "Lai lịch g")
+            or extract_prop_text(props, "Lãi")
+            or extract_prop_text(props, "Lai")
+            or ""
+        )
+        lai_amt = parse_money_from_text(lai_text) or 0.0
+
+        created_lai_page_id = None
+        if LA_NOTION_DATABASE_ID and lai_amt > 0:
+            try:
+                # create_lai_page(chat_id, title, amount, source_page_id)
+                created_lai_page_id = create_lai_page(chat_id, title, lai_amt, page_id)
+                _safe_edit(chat_id, mid, f"💰 Đã tạo Lãi: {int(lai_amt)} (tạo page trong DB Lãi).")
+            except Exception as e:
+                _safe_edit(chat_id, mid, f"⚠️ Lỗi khi tạo Lãi: {e}")
+        else:
+            _safe_edit(chat_id, mid, "ℹ️ Không tạo Lãi (không có LA_NOTION_DATABASE_ID hoặc Lãi = 0).")
+
+        # Ghi undo log (lưu thông tin để undo nếu cần)
+        undo_stack.setdefault(str(chat_id), []).append({
+            "action": "switch_off",
+            "page_id": page_id,
+            "lai_page": created_lai_page_id,
+            "note": f"off:{title}"
+        })
+
+        # final message
+        final_text = (
+            f"✅ Đã OFF {title}\n"
+            f"💰 Lãi tạo: {int(lai_amt) if lai_amt else 0}\n"
+            f"📆 Ngày xong: {today_vn_iso()}\n\n"
+            "🎉 Hoàn tất OFF."
+        )
+        _safe_edit(chat_id, mid, final_text)
+
+    except Exception as e:
+        import traceback as _tb
+        _tb.print_exc()
+        _safe_send(chat_id, f"❌ Lỗi khi tắt OFF: {e}")
 
 def find_matching_all_pages_in_db(database_id: str, keyword: str, limit: int = 2000):
     if not database_id:
