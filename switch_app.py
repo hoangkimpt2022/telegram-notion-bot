@@ -90,17 +90,7 @@ def handle_switch_on(chat_id: int, keyword: str):
         target_id, title, props = matches[0]
         update(f"✅ Đã tìm thấy: {title}")
         time.sleep(0.3)
-        try:
-            ok, res = update_page_properties(target_id, update_props)
-            if not ok:
-                update(f"⚠️ Lỗi cập nhật TARGET (bỏ qua): {res}")
-            else:
-                update(f"✅ Đã cập nhật TARGET DB → Done.")
-        except Exception as e:
-            update(f"⚠️ Lỗi cập nhật TARGET (bỏ qua): {e}")
-
-        time.sleep(0.3)
-        # Tiếp tục...
+        
         time.sleep(0.3)
         # Tiếp tục các bước sau...
         # ---- ĐỌC DỮ LIỆU ----
@@ -115,21 +105,31 @@ def handle_switch_on(chat_id: int, keyword: str):
             update(f"⚠️ 'ngày trước' = 0 → Không tạo ngày nào.")
             return
 
-        # ---- BƯỚC 2: CẬP NHẬT TARGET DB ----
-        update(f"📝 Đang cập nhật trạng thái → In progress ...")
+        # ---- BƯỚC 2: CẬP NHẬT TARGET DB (FAIL-SOFT) ----
+        update("📝 Đang cập nhật trạng thái TARGET → In progress ...")
         today_vn = datetime.now(VN_TZ).date().isoformat()
-
-        update_props = {
-            "trạng thái": {"status": {"name": "In progress"}},
-            "Ngày Đáo": {"date": {"start": today_vn}}
-        }
-
-        ok, res = update_page_properties(target_id, update_props)
-        if not ok:
-            update(f"❌ Lỗi cập nhật TARGET: {res}")
-            return
-
-        update(f"✅ Đã cập nhật TARGET DB.")
+        try:
+            status_key = find_prop_key(props, "trạng thái")
+            ngaydao_key = find_prop_key(props, "Ngày Đáo") or find_prop_key(props, "ngày đáo")
+            update_props = {}
+            if status_key:
+                update_props[status_key] = {
+                    "status": {"name": "In progress"}
+                }
+            if ngaydao_key:
+                update_props[ngaydao_key] = {
+                    "date": {"start": today_vn}
+                }
+            if not update_props:
+                update("⚠️ Không tìm thấy property hợp lệ → bỏ qua cập nhật TARGET.")
+            else:
+                ok, res = update_page_properties(target_id, update_props)
+                if not ok:
+                    update(f"⚠️ Cập nhật TARGET thất bại (bỏ qua): {res}")
+                else:
+                    update("✅ TARGET đã chuyển sang In progress.")
+        except Exception as e:
+            update(f"⚠️ Lỗi cập nhật TARGET (bỏ qua): {e}")
         time.sleep(0.3)
 
         # ---- BƯỚC 3: TẠO CÁC NGÀY TRONG CALENDAR DB ----
@@ -236,17 +236,7 @@ def handle_switch_off(chat_id: int, keyword: str):
         target_id, title, props = matches[0]
         update(f"✅ Đã tìm thấy: {title}")
         time.sleep(0.3)
-        try:
-            ok, res = update_page_properties(target_id, update_props)
-            if not ok:
-                update(f"⚠️ Lỗi cập nhật TARGET (bỏ qua): {res}")
-            else:
-                update(f"✅ Đã cập nhật TARGET DB → Done.")
-        except Exception as e:
-            update(f"⚠️ Lỗi cập nhật TARGET (bỏ qua): {e}")
-
-        time.sleep(0.3)
-        # Tiếp tục...
+        
         # ---- BƯỚC 2: TÌM VÀ XÓA CÁC NGÀY TRONG CALENDAR DB ----
         update(f"🧹 Đang tìm các ngày của '{title}' trong CALENDAR DB ...")
         time.sleep(0.3)
@@ -304,20 +294,30 @@ def handle_switch_off(chat_id: int, keyword: str):
         time.sleep(0.3)
 
         # ---- BƯỚC 4: CẬP NHẬT TARGET DB ----
-        update(f"📝 Đang cập nhật trạng thái → Done ...")
+        update("📝 Đang cập nhật trạng thái TARGET → Done ...")
         today_vn = datetime.now(VN_TZ).date().isoformat()
-
-        update_props = {
-            "trạng thái": {"status": {"name": "Done"}},
-            "ngày xong": {"date": {"start": today_vn}}
-        }
-
-        ok, res = update_page_properties(target_id, update_props)
-        if not ok:
-            update(f"❌ Lỗi cập nhật TARGET: {res}")
-            return
-
-        update(f"✅ Đã cập nhật TARGET DB → Done.")
+        try:
+            status_key = find_prop_key(props, "trạng thái")
+            ngayxong_key = find_prop_key(props, "ngày xong")
+            update_props = {}
+            if status_key:
+                update_props[status_key] = {
+                    "status": {"name": "Done"}
+                }
+            if ngayxong_key:
+                update_props[ngayxong_key] = {
+                    "date": {"start": today_vn}
+                }
+            if not update_props:
+                update("⚠️ Không tìm thấy property hợp lệ → bỏ qua cập nhật TARGET.")
+            else:
+                ok, res = update_page_properties(target_id, update_props)
+                if not ok:
+                    update(f"⚠️ Cập nhật TARGET thất bại (bỏ qua): {res}")
+                else:
+                    update("✅ TARGET đã chuyển sang Done.")
+        except Exception as e:
+            update(f"⚠️ Lỗi cập nhật TARGET (bỏ qua): {e}")
         time.sleep(0.3)
 
         # ---- BƯỚC 5: THÔNG BÁO KẾT QUẢ ----
