@@ -86,6 +86,33 @@ def edit_telegram_message(chat_id, message_id, new_text, parse_mode=None):
     except Exception as e:
         print("edit_telegram_message exception:", e)
         return {}
+        
+def _safe_send(chat_id: int, text: str):
+    """
+    Send Telegram message safely, return message dict or None
+    """
+    try:
+        return send_telegram(chat_id, text)
+    except Exception as e:
+        print("WARN _safe_send:", e)
+        return None
+
+def _safe_edit(chat_id: int, message_id: int | None, text: str):
+    """
+    Edit Telegram message safely
+    """
+    if not message_id:
+        # fallback: send new message
+        try:
+            send_telegram(chat_id, text)
+        except Exception as e:
+            print("WARN _safe_edit fallback:", e)
+        return
+
+    try:
+        edit_telegram_message(chat_id, message_id, text)
+    except Exception as e:
+        print("WARN _safe_edit:", e)
 
 def start_waiting_animation(chat_id: int, message_id: int, duration: int = 120, interval: float = 2.0, label: str = "đang chờ"):
     """
