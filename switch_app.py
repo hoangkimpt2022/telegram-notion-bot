@@ -90,7 +90,19 @@ def handle_switch_on(chat_id: int, keyword: str):
         target_id, title, props = matches[0]
         update(f"✅ Đã tìm thấy: {title}")
         time.sleep(0.3)
+        try:
+            ok, res = update_page_properties(target_id, update_props)
+            if not ok:
+                update(f"⚠️ Lỗi cập nhật TARGET (bỏ qua): {res}")
+            else:
+                update(f"✅ Đã cập nhật TARGET DB → Done.")
+        except Exception as e:
+            update(f"⚠️ Lỗi cập nhật TARGET (bỏ qua): {e}")
 
+        time.sleep(0.3)
+        # Tiếp tục...
+        time.sleep(0.3)
+        # Tiếp tục các bước sau...
         # ---- ĐỌC DỮ LIỆU ----
         total_money = _num(props, "tiền")
         per_day = _num(props, "G ngày")
@@ -108,7 +120,7 @@ def handle_switch_on(chat_id: int, keyword: str):
         today_vn = datetime.now(VN_TZ).date().isoformat()
 
         update_props = {
-            "trạng thái": {"select": {"name": "In progress"}},
+            "trạng thái": {"status": {"name": "In progress"}},
             "Ngày Đáo": {"date": {"start": today_vn}}
         }
 
@@ -178,7 +190,7 @@ def handle_switch_on(chat_id: int, keyword: str):
             "old_trangthai": extract_prop_text(props, "trạng thái") or "",
             "old_ngaydao": extract_prop_text(props, "Ngày Đáo") or ""
         })
-
+        
     except Exception as e:
         traceback.print_exc()
         send_telegram(chat_id, f"❌ Lỗi ON: {e}")
@@ -224,7 +236,17 @@ def handle_switch_off(chat_id: int, keyword: str):
         target_id, title, props = matches[0]
         update(f"✅ Đã tìm thấy: {title}")
         time.sleep(0.3)
+        try:
+            ok, res = update_page_properties(target_id, update_props)
+            if not ok:
+                update(f"⚠️ Lỗi cập nhật TARGET (bỏ qua): {res}")
+            else:
+                update(f"✅ Đã cập nhật TARGET DB → Done.")
+        except Exception as e:
+            update(f"⚠️ Lỗi cập nhật TARGET (bỏ qua): {e}")
 
+        time.sleep(0.3)
+        # Tiếp tục...
         # ---- BƯỚC 2: TÌM VÀ XÓA CÁC NGÀY TRONG CALENDAR DB ----
         update(f"🧹 Đang tìm các ngày của '{title}' trong CALENDAR DB ...")
         time.sleep(0.3)
@@ -286,7 +308,7 @@ def handle_switch_off(chat_id: int, keyword: str):
         today_vn = datetime.now(VN_TZ).date().isoformat()
 
         update_props = {
-            "trạng thái": {"select": {"name": "Done"}},
+            "trạng thái": {"status": {"name": "Done"}},
             "ngày xong": {"date": {"start": today_vn}}
         }
 
@@ -361,7 +383,7 @@ def undo_switch(chat_id: int):
 
         restore_props = {}
         if old_tt:
-            restore_props["trạng thái"] = {"select": {"name": old_tt}}
+            restore_props["trạng thái"] = {"status": {"name": old_tt}}
         if old_nd:
             restore_props["Ngày Đáo"] = {"date": {"start": old_nd}}
 
@@ -411,7 +433,7 @@ def undo_switch(chat_id: int):
 
         restore_props = {}
         if old_tt:
-            restore_props["trạng thái"] = {"select": {"name": old_tt}}
+            restore_props["trạng thái"] = {"status": {"name": old_tt}}
         if old_nx:
             restore_props["ngày xong"] = {"date": {"start": old_nx}}
 
