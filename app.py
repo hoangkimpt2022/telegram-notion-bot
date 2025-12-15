@@ -1914,7 +1914,7 @@ def handle_incoming_message(chat_id: int, text: str):
         keyword, count, action = parse_user_command(raw)
         kw = keyword  # giữ lại cho auto-mark
         # ===== SWITCH ON / OFF =====
-        parts = low_raw.split()
+        parts = low.split()
         if len(parts) >= 2 and parts[-1] in ("on", "off"):
             kw = " ".join(parts[:-1])  # ví dụ: "g034"
             if parts[-1] == "on":
