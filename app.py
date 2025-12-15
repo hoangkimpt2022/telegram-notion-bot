@@ -22,7 +22,6 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from flask import Flask, request, jsonify
-VN_TZ = timezone(timedelta(hours=7))
 # ------------- CONFIG -------------
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
@@ -85,58 +84,6 @@ def edit_telegram_message(chat_id, message_id, new_text, parse_mode=None):
     except Exception as e:
         print("edit_telegram_message exception:", e)
         return {}
-
-def _safe_send(chat_id: int, text: str):
-    """
-    Send Telegram message safely, return message dict or None
-    """
-    try:
-        return send_telegram(chat_id, text)
-    except Exception as e:
-        print("WARN _safe_send:", e)
-        return None
-
-def _safe_edit(chat_id: int, message_id: int | None, text: str):
-    """
-    Edit Telegram message safely
-    """
-    if not message_id:
-        # fallback: send new message
-        try:
-            send_telegram(chat_id, text)
-        except Exception as e:
-            print("WARN _safe_edit fallback:", e)
-        return
-
-    try:
-        edit_telegram_message(chat_id, message_id, text)
-    except Exception as e:
-        print("WARN _safe_edit:", e)
-# --- Helper: safely extract message_id from Telegram send/edit response
-def _extract_mid(msg):
-    """
-    Trả về message_id (int) nếu có, hoặc None.
-    Hỗ trợ các dạng:
-      - None
-      - dict như Telegram API: {"ok": True, "result": {..., "message_id": 123, ...}}
-      - dict có trực tiếp "message_id"
-    """
-    if not msg:
-        return None
-    try:
-        if isinstance(msg, dict):
-            # Telegram API typical response
-            res = msg.get("result")
-            if isinstance(res, dict):
-                mid = res.get("message_id")
-                if isinstance(mid, int):
-                    return mid
-            # fallback: maybe caller already returned message object
-            if "message_id" in msg and isinstance(msg.get("message_id"), int):
-                return msg.get("message_id")
-        return None
-    except Exception:
-        return None
 
 def start_waiting_animation(chat_id: int, message_id: int, duration: int = 120, interval: float = 2.0, label: str = "đang chờ"):
     """
@@ -254,28 +201,6 @@ def query_database_all(database_id: str, page_size: int = MAX_QUERY_PAGE_SIZE) -
     except Exception as e:
         print("query_database_all exception:", e)
         return []
-def get_page(page_id: str):
-    """Retrieve full Notion page (pages.retrieve)."""
-    if not NOTION_TOKEN or not page_id:
-        print("get_page missing config")
-        return {}
-
-    try:
-        url = f"https://api.notion.com/v1/pages/{page_id}"
-        r = requests.get(url, headers=NOTION_HEADERS, timeout=15)
-        if r.status_code != 200:
-            print("get_page failed:", r.status_code, r.text)
-            return {}
-        return r.json()
-    except Exception as e:
-        print("get_page exception:", e)
-        return {}
-
-def today_vn_iso():
-    """ISO date (YYYY-MM-DD) ở timezone VN (UTC+7). Chỉ dùng cho metadata (Ngày Đáo / ngày xong)."""
-    return datetime.now(VN_TZ).date().isoformat()
-
-pending_switch_on = {}  # chat_id -> payload
 
 def create_page_in_db(database_id: str, properties: Dict[str, Any]) -> Tuple[bool, Any]:
     if not NOTION_TOKEN or not database_id:
@@ -501,215 +426,76 @@ def find_target_matches(keyword: str, db_id: str = TARGET_NOTION_DATABASE_ID):
             out.append((p.get("id"), title, props))
 
     return out
-# Replace your existing handle_switch_on with this implementation:
-def handle_switch_on(chat_id: int, keyword: str):
+
+def find_calendar_matches(keyword: str):
     """
-    Safe ON:
-    - Cập nhật: 'trạng thái' -> In progress, 'Ngày Đáo' -> hôm nay (UTC+7)
-    - Tạo ngày góp
-    - Hiển thị message ON ĐẦY ĐỦ (đúng format yêu cầu)
-    - Ghi undo log (snapshot + created_pages)
+    MATCH linh hoạt trong NOTION_DATABASE_ID:
+    - Tìm theo mã Gxxx (normalize G024 → g24)
+    - Tìm theo tên (tam → match tam, tam14, tam-xxx…)
+    - Tự động loại bỏ page đã tích Đã Góp
     """
-    try:
-        matches = find_target_matches(keyword)
-        if not matches:
-            _safe_send(chat_id, f"❌ Không tìm thấy {keyword}")
-            return
+    if not NOTION_DATABASE_ID:
+        return []
 
-        page_id, title, _ = matches[0]
-        page = get_page(page_id)
-        props = page.get("properties", {}) if isinstance(page, dict) else {}
+    kw = normalize_text(keyword)
+    is_gcode = bool(re.match(r'^g[0-9]+$', kw))
+    kw_g = normalize_gcode(kw) if is_gcode else None
 
-        # ===== tìm property keys =====
-        status_key   = find_prop_key(props, "trạng thái")
-        ngay_dao_key = find_prop_key(props, "Ngày Đáo") or find_prop_key(props, "ngày đáo")
+    pages = query_database_all(NOTION_DATABASE_ID, page_size=MAX_QUERY_PAGE_SIZE)
+    matches = []
 
-        # ===== start telegram animation =====
-        msg = _safe_send(chat_id, f"🔄 Đang bật ON cho: {title}")
-        mid = _extract_mid(msg)
+    for p in pages:
+        props = p.get("properties", {})
+        title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
+        if not title:
+            continue
 
-        # ===== snapshot cho undo =====
-        snapshot = {}
-        if status_key:
-            snapshot[status_key] = props.get(status_key)
-        if ngay_dao_key:
-            snapshot[ngay_dao_key] = props.get(ngay_dao_key)
+        title_clean = normalize_text(title)
+        tokens = tokenize_title(title)
 
-        # ===== 1) PATCH trạng thái =====
-        if status_key:
-            ok, res = update_page_properties(page_id, {
-                status_key: {"select": {"name": "In progress"}}
-            })
-            if not ok:
-                _safe_edit(chat_id, mid, f"⚠️ Không thể cập nhật 'trạng thái': {res}")
+        matched = False
 
-        # ===== 2) PATCH Ngày Đáo =====
-        if ngay_dao_key:
-            ok, res = update_page_properties(page_id, {
-                ngay_dao_key: {"date": {"start": today_vn_iso()}}
-            })
-            if not ok:
-                _safe_edit(chat_id, mid, f"⚠️ Không thể cập nhật 'Ngày Đáo': {res}")
+        if title_clean == kw:
+            matched = True
 
-        # ===== 3) LẤY DỮ LIỆU TÍNH TOÁN =====
-        def _num(prop):
-            try:
-                return int(parse_money_from_text(extract_prop_text(props, prop) or "0"))
-            except Exception:
-                try:
-                    return int(extract_prop_text(props, prop) or 0)
-                except Exception:
-                    return 0
+        if not matched and is_gcode:
+            for tk in tokens:
+                if normalize_gcode(tk) == kw_g:
+                    matched = True
+                    break
 
-        total_money = _num("tiền")
-        per_day     = _num("G ngày")
-        total_days  = _num("tổng ngày g")
-        take_days   = _num("ngày trước")
-        truoc_val   = _num("trước")
-        ck_val      = _num("CK")
+        if not matched and not is_gcode:
+            for tk in tokens:
+                if kw in tk:
+                    matched = True
+                    break
 
-        # ===== 4) TẠO NGÀY GÓP =====
-        start_date = datetime.now(VN_TZ).date()
-        days = [(start_date + timedelta(days=i)) for i in range(take_days)]
+        if not matched and title_clean.startswith(kw + "-"):
+            matched = True
 
-        created_pages = []
+        if not matched:
+            continue
 
-        if take_days > 0:
-            for i, d in enumerate(days, start=1):
-                try:
-                    res = create_page_in_db(NOTION_DATABASE_ID, {
-                        "Name": {"title": [{"text": {"content": title}}]},
-                        "Ngày Góp": {"date": {"start": d.isoformat()}},
-                        "Tiền": {"number": per_day},
-                        "Đã Góp": {"checkbox": True},
-                        "Lịch G": {"relation": [{"id": page_id}]},
-                    })
-                    if isinstance(res, dict) and res.get("id"):
-                        created_pages.append(res["id"])
-                    elif isinstance(res, tuple) and res[1].get("id"):
-                        created_pages.append(res[1]["id"])
-                except Exception as e:
-                    print("Create day error:", e)
-
-                _safe_edit(chat_id, mid, f"📆 Tạo ngày {i}/{take_days}: {d.isoformat()}")
-                time.sleep(0.12)
-
-        # ===== 5) GHI UNDO LOG =====
-        undo_stack.setdefault(str(chat_id), []).append({
-            "action": "switch_on",
-            "page_id": page_id,
-            "snapshot": snapshot,
-            "created_pages": created_pages,
-        })
-
-        # ===== 6) BUILD MESSAGE ON ĐẦY ĐỦ (ĐÚNG FORMAT) =====
-        lines = []
-        lines.append(f"🔔 Đã bật ON cho: {title}")
-        lines.append(f"với số tiền {total_money:,} ngày {per_day:,} góp {total_days} ngày")
-        lines.append(f"💴 Lấy trước: {take_days} ngày {per_day:,} là {truoc_val:,}")
-        lines.append("   ( từ hôm nay):")
-        for i, d in enumerate(days, start=1):
-            lines.append(f"{i}. {d.isoformat()}")
-        lines.append("")
-        lines.append(f"🏛️ Tổng CK: ✅ {ck_val:,}")
-        next_start = (start_date + timedelta(days=take_days)).strftime("%d-%m-%Y")
-        lines.append(f"📆 Đến ngày {next_start} bắt đầu góp lại")
-        lines.append("")
-        lines.append("🎉 Hoàn tất ON.")
-
-        _safe_edit(chat_id, mid, "\n".join(lines))
-
-    except Exception as e:
-        import traceback as _tb
-        _tb.print_exc()
-        _safe_send(chat_id, f"❌ Lỗi khi bật ON: {e}")
-
-# --- Replace/insert this: safe OFF handler (no relation updates) ---
-def handle_switch_off(chat_id: int, keyword: str):
-    """
-    Safe OFF:
-    - Chỉ cập nhật: 'trạng thái' -> Done, 'ngày xong' -> hôm nay (UTC+7)
-    - Kích hoạt tạo Lãi (create_lai_page) dựa trên cột 'Lai lịch g' nếu có cấu hình LA_NOTION_DATABASE_ID
-    - Ghi undo log
-    """
-    try:
-        matches = find_target_matches(keyword)
-        if not matches:
-            _safe_send(chat_id, f"❌ Không tìm thấy {keyword}")
-            return
-
-        page_id, title, _ = matches[0]
-        page = get_page(page_id)
-        props = page.get("properties", {}) if isinstance(page, dict) else {}
-
-        status_key = find_prop_key(props, "trạng thái")
-        ngay_xong_key = find_prop_key(props, "ngày xong") or find_prop_key(props, "Ngày xong") or find_prop_key(props, "Ngày Xong")
-
-        # start animation msg
-        msg = _safe_send(chat_id, f"🔄 Đang tắt (OFF) cho: {title} ...")
-        mid = _extract_mid(msg)
-
-        # 1) set status Done
-        if status_key:
-            ok, res = update_page_properties(page_id, {
-                status_key: {"select": {"name": "Done"}}
-            })
-            if not ok:
-                _safe_edit(chat_id, mid, f"⚠️ Không thể cập nhật 'trạng thái': {res}")
-        else:
-            _safe_edit(chat_id, mid, "⚠️ Không tìm thấy cột 'trạng thái' để cập nhật.")
-
-        # 2) set ngày xong = hôm nay
-        if ngay_xong_key:
-            ok, res = update_page_properties(page_id, {
-                ngay_xong_key: {"date": {"start": today_vn_iso()}}
-            })
-            if not ok:
-                _safe_edit(chat_id, mid, f"⚠️ Không thể cập nhật 'ngày xong': {res}")
-        else:
-            _safe_edit(chat_id, mid, "ℹ️ Trang này không có cột 'ngày xong' để cập nhật.")
-
-        # 3) Tạo Lãi: lấy từ cột 'Lai lịch g' (ưu tiên) hoặc 'Lãi'...
-        lai_text = (
-            extract_prop_text(props, "Lai lịch g")
-            or extract_prop_text(props, "Lãi")
-            or extract_prop_text(props, "Lai")
-            or ""
+        # Bỏ page đã tích
+        cb_key = (
+            find_prop_key(props, "Đã Góp")
+            or find_prop_key(props, "Sent")
+            or find_prop_key(props, "Status")
         )
-        lai_amt = parse_money_from_text(lai_text) or 0.0
+        if cb_key and props.get(cb_key, {}).get("checkbox"):
+            continue
 
-        created_lai_page_id = None
-        if LA_NOTION_DATABASE_ID and lai_amt > 0:
-            try:
-                # create_lai_page(chat_id, title, amount, source_page_id)
-                created_lai_page_id = create_lai_page(chat_id, title, lai_amt, page_id)
-                _safe_edit(chat_id, mid, f"💰 Đã tạo Lãi: {int(lai_amt)} (tạo page trong DB Lãi).")
-            except Exception as e:
-                _safe_edit(chat_id, mid, f"⚠️ Lỗi khi tạo Lãi: {e}")
-        else:
-            _safe_edit(chat_id, mid, "ℹ️ Không tạo Lãi (không có LA_NOTION_DATABASE_ID hoặc Lãi = 0).")
+        date_iso = None
+        date_key = find_prop_key(props, "Ngày Góp")
+        if date_key:
+            df = props.get(date_key, {}).get("date")
+            if df:
+                date_iso = df.get("start")
 
-        # Ghi undo log (lưu thông tin để undo nếu cần)
-        undo_stack.setdefault(str(chat_id), []).append({
-            "action": "switch_off",
-            "page_id": page_id,
-            "lai_page": created_lai_page_id,
-            "note": f"off:{title}"
-        })
+        matches.append((p.get("id"), title, date_iso, props))
 
-        # final message
-        final_text = (
-            f"✅ Đã OFF {title}\n"
-            f"💰 Lãi tạo: {int(lai_amt) if lai_amt else 0}\n"
-            f"📆 Ngày xong: {today_vn_iso()}\n\n"
-            "🎉 Hoàn tất OFF."
-        )
-        _safe_edit(chat_id, mid, final_text)
-
-    except Exception as e:
-        import traceback as _tb
-        _tb.print_exc()
-        _safe_send(chat_id, f"❌ Lỗi khi tắt OFF: {e}")
+    matches.sort(key=lambda x: (x[2] is None, x[2] or ""))
+    return matches
 
 def find_matching_all_pages_in_db(database_id: str, keyword: str, limit: int = 2000):
     if not database_id:
@@ -997,26 +783,6 @@ def undo_last(chat_id: str, count: int = 1):
                 print("Undo dao — restore old_day lỗi:", e)
 
         send_telegram(chat_id, "✅ Hoàn tác đáo thành công.")
-        return
-    if action == "switch":
-        page_id = log.get("page_id")
-        snapshot = log.get("snapshot", {})
-        created_pages = log.get("created_pages", [])
-
-        send_telegram(chat_id, "♻️ Đang undo ON/OFF ...")
-
-        # rollback metadata
-        if snapshot:
-            update_page_properties(page_id, snapshot)
-
-        # xóa ngày tạo thêm (chỉ khi undo ON)
-        for pid in created_pages:
-            try:
-                archive_page(pid)
-            except Exception as e:
-                print("Undo switch archive error:", e)
-
-        send_telegram(chat_id, "✅ Undo ON/OFF thành công.")
         return
 
     # ---------------------------------------------------------
@@ -1879,23 +1645,23 @@ def handle_incoming_message(chat_id: int, text: str):
         keyword, count, action = parse_user_command(raw)
         kw = keyword  # giữ lại cho auto-mark
         # ===== SWITCH ON / OFF =====
-        parts = low.split()
-        if len(parts) >= 2 and parts[-1] in ("on", "off"):
-            kw = " ".join(parts[:-1])  # ví dụ: "g034"
-            if parts[-1] == "on":
-                threading.Thread(
-                    target=handle_switch_on,
-                    args=(chat_id, kw),
-                    daemon=True
-                ).start()
-                return
-            else:
-                threading.Thread(
-                    target=handle_switch_off,
-                    args=(chat_id, kw),
-                    daemon=True
-                ).start()
-                return
+        low_raw = raw.strip().lower()
+
+        if low_raw.endswith(" on"):
+            threading.Thread(
+                target=switch_app.handle_switch_on,
+                args=(chat_id, kw),
+                daemon=True
+            ).start()
+            return
+
+        if low_raw.endswith(" off"):
+            threading.Thread(
+                target=switch_app.handle_switch_off,
+                args=(chat_id, kw),
+                daemon=True
+            ).start()
+            return
 
         # --- AUTO-MARK MODE ---
         if action == "mark" and count > 0:
@@ -2221,6 +1987,7 @@ def sweep_pending_expirations():
         time.sleep(5)
 
 threading.Thread(target=sweep_pending_expirations, daemon=True).start()
+
 # ------------- FLASK APP / WEBHOOK -------------
 app = Flask(__name__)
 
@@ -2294,7 +2061,6 @@ def auto_ping_render():
 
         # đợi 5 phút rồi ping lại
         time.sleep(300)  # 30780s = 13 phút
-        
 # ------------- RUN (local test) -------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
