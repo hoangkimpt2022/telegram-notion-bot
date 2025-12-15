@@ -22,6 +22,9 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from flask import Flask, request, jsonify
+# ===== Switch ON/OFF plugin =====
+import switch_app
+
 # ------------- CONFIG -------------
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
@@ -1692,14 +1695,17 @@ def handle_incoming_message(chat_id: int, text: str):
 
         # --- UNDO ---
         if action == "undo":
-            # ưu tiên undo ON / OFF nếu có
+            # Ưu tiên undo ON / OFF nếu có
             if undo_stack.get(str(chat_id)):
-                threading.Thread(
-                    target=undo_switch,
-                    args=(chat_id,),
-                    daemon=True
-                ).start()
-                return
+                last_action = undo_stack[str(chat_id)][-1].get("action")
+                if last_action in ("switch_on", "switch_off"):
+                    from switch_app import undo_switch
+                    threading.Thread(
+                        target=undo_switch,
+                        args=(chat_id,),
+                        daemon=True
+                    ).start()
+                    return
 
             # fallback undo cũ
             send_telegram(chat_id, "♻️ Đang hoàn tác hành động gần nhất ...")
@@ -1987,6 +1993,23 @@ def sweep_pending_expirations():
         time.sleep(5)
 
 threading.Thread(target=sweep_pending_expirations, daemon=True).start()
+# ===== Init switch_app dependencies =====
+switch_app.init_switch_deps(
+    send_telegram=send_telegram,
+    edit_telegram_message=edit_telegram_message,
+    find_target_matches=find_target_matches,
+    extract_prop_text=extract_prop_text,
+    parse_money_from_text=parse_money_from_text,
+    create_page_in_db=create_page_in_db,
+    archive_page=archive_page,
+    unarchive_page=unarchive_page,
+    update_page_properties=update_page_properties,
+    create_lai_page=create_lai_page,
+    query_database_all=query_database_all,
+    undo_stack=undo_stack,
+    NOTION_DATABASE_ID=NOTION_DATABASE_ID,
+    find_prop_key=find_prop_key,
+)
 
 # ------------- FLASK APP / WEBHOOK -------------
 app = Flask(__name__)
