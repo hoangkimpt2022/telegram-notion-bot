@@ -22,8 +22,7 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from flask import Flask, request, jsonify
-# ===== Switch ON/OFF plugin =====
-
+VN_TZ = timezone(timedelta(hours=7))
 # ------------- CONFIG -------------
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
 NOTION_VERSION = os.getenv("NOTION_VERSION", "2022-06-28")
@@ -273,15 +272,8 @@ def get_page(page_id: str):
         return {}
 
 def today_vn_iso():
-    """
-    ⚠️ CHỈ DÙNG CHO METADATA:
-    - Ngày Đáo
-    - ngày xong
-    - trạng thái
-    ❌ KHÔNG DÙNG cho logic đáo
-    """
-    vn_tz = timezone(timedelta(hours=7))
-    return datetime.now(vn_tz).date().isoformat()
+    """ISO date (YYYY-MM-DD) ở timezone VN (UTC+7). Chỉ dùng cho metadata (Ngày Đáo / ngày xong)."""
+    return datetime.now(VN_TZ).date().isoformat()
 
 pending_switch_on = {}  # chat_id -> payload
 
@@ -510,135 +502,138 @@ def find_target_matches(keyword: str, db_id: str = TARGET_NOTION_DATABASE_ID):
 
     return out
 # Replace your existing handle_switch_on with this implementation:
+# --- Safe ON handler (copy/paste vào file) ---
 def handle_switch_on(chat_id: int, keyword: str):
+    """
+    Safe implementation of ON:
+    - Patch status, Ngày Đáo, relations (each in separate update requests)
+    - Then create the per-day pages (keeps your existing creation logic)
+    - Finally edit Telegram with a friendly report (matching format you requested)
+    """
     try:
-        # find target
         matches = find_target_matches(keyword)
         if not matches:
             _safe_send(chat_id, f"❌ Không tìm thấy {keyword}")
             return
 
         page_id, title, _ = matches[0]
+
+        # get current page properties
         page = get_page(page_id)
-        props = page["properties"]
+        props = page.get("properties", {}) if isinstance(page, dict) else {}
 
-
-        # get full page props (must be full properties for find_prop_key to work)
-        page = get_page(page_id)
-        props = page.get("properties", {})
-
-        # resolve property ids (property keys)
+        # resolve property keys
         status_key   = find_prop_key(props, "trạng thái")
         ngay_dao_key = find_prop_key(props, "Ngày Đáo")
-        qdt_key      = find_prop_key(props, "Tổng Quan Đầu Tư")
-        ttd_key      = find_prop_key(props, "Tổng Thụ Động")
+        qdt_key      = find_prop_key(props, "Tổng Quan Đầu Tư") or find_prop_key(props, "Tổng Quan Thụ Động")
+        ttd_key      = find_prop_key(props, "Tổng Thụ Động") or find_prop_key(props, "Tổng Thụ Động")
 
-        # start telegram animated message
+        # start telegram message (and keep message_id for edits)
         msg = _safe_send(chat_id, f"🔄 Đang bật ON cho {title} ...")
         mid = _extract_mid(msg)
 
-        # update target page once (property ids)
-        upd = {}
+        # 1) PATCH trạng thái
         if status_key:
-            upd[status_key] = {"select": {"name": "In progress"}}
-        else:
-            _safe_edit(chat_id, None, "⚠️ Warning: 'trạng thái' column not found on target page.")
+            ok, res = update_page_properties(page_id, {
+                status_key: {"select": {"name": "In progress"}}
+            })
+            if not ok:
+                _safe_edit(chat_id, mid, f"⚠️ Không thể cập nhật 'trạng thái': {res}")
 
+        # 2) PATCH Ngày Đáo (metadata only)
         if ngay_dao_key:
-            upd[ngay_dao_key] = {"date": {"start": today_vn_iso()}}
-        else:
-            _safe_edit(chat_id, None, "⚠️ Warning: 'Ngày Đáo' column not found on target page.")
+            ok, res = update_page_properties(page_id, {
+                ngay_dao_key: {"date": {"start": today_vn_iso()}}
+            })
+            if not ok:
+                _safe_edit(chat_id, mid, f"⚠️ Không thể cập nhật 'Ngày Đáo': {res}")
 
-        # relation keys: qdt_key / ttd_key
-        qdt_pid = os.getenv("SWITCH_QDT_PAGE_ID")
+        # 3) PATCH relations: Tổng Quan Đầu Tư -> "Thụ động", Tổng Thụ Động -> "G"
+        # Use environment variables that should point to the target page IDs
+        qdt_pid = os.getenv("SWITCH_QDT_PAGE_ID")   # expected to be page id for "Thụ động"
+        ttd_pid = os.getenv("SWITCH_TTD_PAGE_ID")   # expected to be page id for "G"
+
+        # If env var missing, we will clear relation (safe) and notify.
         if qdt_key:
-            if qdt_pid:
-                upd[qdt_key] = {"relation": [{"id": qdt_pid}]}
-            else:
-                upd[qdt_key] = {"relation": []}
-                _safe_edit(chat_id, mid, "⚠️ Warning: SWITCH_QDT_PAGE_ID not set — 'Tổng Quan Đầu Tư' not linked.")
-        else:
-            _safe_edit(chat_id, None, "⚠️ Warning: 'Tổng Quan Đầu Tư' column not found on target page.")
+            payload = { qdt_key: {"relation": [{"id": qdt_pid}]} } if qdt_pid else { qdt_key: {"relation": []} }
+            ok, res = update_page_properties(page_id, payload)
+            if not ok:
+                _safe_edit(chat_id, mid, f"⚠️ Không thể cập nhật 'Tổng Quan Đầu Tư': {res}")
 
-        ttd_pid = os.getenv("SWITCH_TTD_PAGE_ID")
         if ttd_key:
-            if ttd_pid:
-                upd[ttd_key] = {"relation": [{"id": ttd_pid}]}
-            else:
-                upd[ttd_key] = {"relation": []}
-                _safe_edit(chat_id, mid, "⚠️ Warning: SWITCH_TTD_PAGE_ID not set — 'Tổng Thụ Động' not linked.")
-        else:
-            _safe_edit(chat_id, None, "⚠️ Warning: 'Tổng Thụ Động' column not found on target page.")
+            payload = { ttd_key: {"relation": [{"id": ttd_pid}]} } if ttd_pid else { ttd_key: {"relation": []} }
+            ok, res = update_page_properties(page_id, payload)
+            if not ok:
+                _safe_edit(chat_id, mid, f"⚠️ Không thể cập nhật 'Tổng Thụ Động': {res}")
 
-        try:
-            update_page_properties(page_id, upd)
-        except Exception as e:
-            # still continue but warn
-            _safe_edit(chat_id, mid, f"⚠️ Cảnh báo khi cập nhật trang: {e}")
-
-        # read numeric fields (exact mapping)
+        # 4) Read numeric fields for creating days (safe parsing)
         try:
             total_money = int(parse_money_from_text(extract_prop_text(props, "tiền") or "0"))
         except Exception:
             total_money = int(extract_prop_text(props, "tiền") or 0)
+
         try:
-            g_ngay = int(parse_money_from_text(extract_prop_text(props, "G ngày") or "0"))
+            g_ngay = int(parse_money_from_text(extract_prop_text(props, "G ngày") or extract_prop_text(props, "Gngày") or "0") or 0)
         except Exception:
             g_ngay = int(extract_prop_text(props, "G ngày") or 0)
+
         try:
-            total_gop = int(extract_prop_text(props, "tổng ngày g") or 0)
+            total_gop = int(float(extract_prop_text(props, "tổng ngày g") or extract_prop_text(props, "tổng ngày") or 0))
         except Exception:
             total_gop = int(extract_prop_text(props, "tổng ngày g") or 0)
+
         try:
-            take_days = int(extract_prop_text(props, "ngày trước") or 0)
+            take_days = int(float(extract_prop_text(props, "ngày trước") or 0))
         except Exception:
             take_days = int(extract_prop_text(props, "ngày trước") or 0)
+
         try:
             truoc_val = int(parse_money_from_text(extract_prop_text(props, "trước") or "0"))
         except Exception:
             truoc_val = int(extract_prop_text(props, "trước") or 0)
+
         try:
             ck_val = int(parse_money_from_text(extract_prop_text(props, "CK") or "0"))
         except Exception:
             ck_val = int(extract_prop_text(props, "CK") or 0)
 
-        # Prepare day list
-        start_date = (datetime.utcnow() + timedelta(hours=7)).date()
+        # 5) Create day pages in NOTION_DATABASE_ID (keep existing creation logic)
+        # We'll compute start_date = today VN and create 'take_days' pages starting from today
+        start_date = datetime.now(VN_TZ).date()
         days = [(start_date + timedelta(days=i)) for i in range(take_days)]
 
-        # Animation: spinner + per-day progress bar while creating pages
-        spinner = ["⠋","⠙","⠚","⠞","⠖","⠦","⠴","⠲"]
-        bar_len = 10
         created_pages = []
+        # notify user progress
+        if take_days <= 0:
+            _safe_edit(chat_id, mid, "ℹ️ Không có ngày để tạo (ngày trước = 0).")
+        else:
+            spinner = ["⠋","⠙","⠚","⠞","⠖","⠦","⠴","⠲"]
+            bar_len = 10
+            for i, d in enumerate(days, start=1):
+                try:
+                    res = create_page_in_db(NOTION_DATABASE_ID, {
+                        "Name": {"title": [{"text": {"content": title}}]},
+                        "Ngày Góp": {"date": {"start": d.isoformat()}},
+                        "Tiền": {"number": g_ngay},
+                        "Đã Góp": {"checkbox": True},
+                        "Lịch G": {"relation": [{"id": page_id}]},
+                    })
+                    # append created id if possible
+                    if isinstance(res, dict) and res.get("id"):
+                        created_pages.append(res.get("id"))
+                    elif isinstance(res, tuple) and len(res) >= 2 and isinstance(res[1], dict) and res[1].get("id"):
+                        created_pages.append(res[1].get("id"))
+                except Exception as e:
+                    print("WARN create page:", e)
 
-        for i, d in enumerate(days, start=1):
-            # create the page in calendar DB
-            try:
-                res = create_page_in_db(NOTION_DATABASE_ID, {
-                    "Name": {"title": [{"text": {"content": title}}]},
-                    "Ngày Góp": {"date": {"start": d.isoformat()}},
-                    "Tiền": {"number": g_ngay},
-                    "Đã Góp": {"checkbox": True},
-                    "Lịch G": {"relation": [{"id": page_id}]},
-                })
-                # if your create returns dict with id, append; adapt if create_page_in_db returns different shape
-                if isinstance(res, dict) and res.get("id"):
-                    created_pages.append(res["id"])
-                elif isinstance(res, tuple) and len(res) >= 2 and isinstance(res[1], dict) and res[1].get("id"):
-                    created_pages.append(res[1]["id"])
-            except Exception as e:
-                # don't fail whole flow; log and continue
-                print("WARN create page:", e)
+                pct = int((i / max(1, take_days)) * 100)
+                filled = int((i / max(1, take_days)) * bar_len)
+                bar = "█" * filled + "░" * (bar_len - filled)
+                spin = spinner[i % len(spinner)]
+                _safe_edit(chat_id, mid, f"{spin} 📆 {i}/{take_days} — {d.isoformat()}\nProgress: [{bar}] {pct}%")
+                time.sleep(0.14)
 
-            # build progress bar & spinner
-            pct = int((i / max(1, take_days)) * 100)
-            filled = int((i / max(1, take_days)) * bar_len)
-            bar = "█" * filled + "░" * (bar_len - filled)
-            spin = spinner[i % len(spinner)]
-            _safe_edit(chat_id, mid, f"{spin} 📆 {i}/{take_days} — {d.isoformat()}\nProgress: [{bar}] {pct}%")
-            time.sleep(0.14)
-
-        # push undo record
+        # 6) Push undo record
         try:
             undo_stack.setdefault(str(chat_id), []).append({
                 "action": "switch_on",
@@ -654,7 +649,7 @@ def handle_switch_on(chat_id: int, keyword: str):
         except Exception:
             print("WARN: cannot push undo_stack")
 
-        # Final report (exact format you requested)
+        # 7) Final friendly report (format per your example)
         lines = []
         lines.append(f"🔔 Đã bật ON cho: {title}")
         lines.append(f"với số tiền {total_money:,} ngày {g_ngay:,} góp {total_gop} ngày")
@@ -664,16 +659,26 @@ def handle_switch_on(chat_id: int, keyword: str):
             lines.append(f"{idx}. {d.isoformat()}")
         lines.append("")
         lines.append(f"🏛️ Tổng CK: ✅ {ck_val:,}")
-        lines.append(f"📆 Đến ngày {(start_date + timedelta(days=take_days)).strftime('%d-%m-%Y')} bắt đầu góp lại")
+        # next contribute day = start_date + take_days
+        next_start = (start_date + timedelta(days=take_days)).strftime('%d-%m-%Y')
+        lines.append(f"📆 Đến ngày {next_start} bắt đầu góp lại")
         lines.append("")
         lines.append("🎉 Hoàn tất ON.")
         _safe_edit(chat_id, mid, "\n".join(lines))
 
     except Exception as e:
         traceback.print_exc()
-        _safe_edit(chat_id, None, f"❌ Lỗi khi bật ON: {e}")
+        _safe_edit(chat_id, None, f"❌ Lỗi ON: {e}")
 
+
+# --- Safe OFF handler (copy/paste into file) ---
 def handle_switch_off(chat_id: int, keyword: str):
+    """
+    Safe implementation of OFF:
+    - Archive related day pages
+    - Patch Done + ngày xong + clear relations (each in separate requests)
+    - Create Lãi using create_lai_page(...) (so it uses the same LA DB)
+    """
     try:
         matches = find_target_matches(keyword)
         if not matches:
@@ -682,19 +687,19 @@ def handle_switch_off(chat_id: int, keyword: str):
 
         page_id, title, _ = matches[0]
         page = get_page(page_id)
-        props = page.get("properties", {})
+        props = page.get("properties", {}) if isinstance(page, dict) else {}
 
-        # resolve property keys (safe)
+        # resolve property keys
         status_key = find_prop_key(props, "trạng thái")
         ngay_xong_key = find_prop_key(props, "ngày xong")
-        qdt_key = find_prop_key(props, "Tổng Quan Đầu Tư")
+        qdt_key = find_prop_key(props, "Tổng Quan Đầu Tư") or find_prop_key(props, "Tổng Quan Thụ Động")
         ttd_key = find_prop_key(props, "Tổng Thụ Động")
 
-        # start message (safe)
+        # start message
         msg = _safe_send(chat_id, f"⏳ Đang OFF {title} ...")
         mid = _extract_mid(msg)
 
-        # find related calendar pages
+        # 1) find related calendar pages (by relation Lịch G)
         all_pages = query_database_all(NOTION_DATABASE_ID)
         related_ids = []
         for p in all_pages:
@@ -702,67 +707,64 @@ def handle_switch_off(chat_id: int, keyword: str):
             if any(r.get("id") == page_id for r in rels):
                 related_ids.append(p.get("id"))
 
+        # 2) archive them with progress
         total = len(related_ids)
         bar_len = 10
-
-        # animation delete
         for i, pid in enumerate(related_ids, start=1):
             try:
                 archive_page(pid)
             except Exception as e:
                 print("WARN archive_page:", e)
 
-            filled = int((i / max(1, total)) * bar_len)
+            filled = int((i / max(1, total)) * bar_len) if total else bar_len
             bar = "█" * filled + "░" * (bar_len - filled)
-
             _safe_edit(chat_id, mid, f"🗑️ {i}/{total} [{bar}]")
             time.sleep(0.12)
 
-        # read CK (lãi)
+        # 3) read CK value for creating Lãi
         try:
             ck_val = int(parse_money_from_text(extract_prop_text(props, "CK") or "0"))
         except Exception:
             ck_val = int(extract_prop_text(props, "CK") or 0)
 
-        # create lãi page if any
-        if ck_val > 0:
-            try:
-                create_lai_page(chat_id, title, ck_val, page_id)
-            except Exception as e:
-                print("WARN create_lai_page:", e)
-
-        # Build update payload only with keys that exist
-        upd = {}
+        # 4) Patch metadata individually (status, ngay_xong, clear relations)
         if status_key:
-            upd[status_key] = {"select": {"name": "Done"}}
-        else:
-            _safe_edit(chat_id, mid, "⚠️ Warning: 'trạng thái' column not found; cannot set Done.")
+            ok, res = update_page_properties(page_id, {status_key: {"select": {"name": "Done"}}})
+            if not ok:
+                _safe_edit(chat_id, mid, f"⚠️ Không thể đặt trạng thái Done: {res}")
 
         if ngay_xong_key:
-            upd[ngay_xong_key] = {"date": {"start": today_vn_iso()}}
-        else:
-            _safe_edit(chat_id, mid, "⚠️ Warning: 'ngày xong' column not found; cannot set date.")
+            ok, res = update_page_properties(page_id, {ngay_xong_key: {"date": {"start": today_vn_iso()}}})
+            if not ok:
+                _safe_edit(chat_id, mid, f"⚠️ Không thể cập nhật 'ngày xong': {res}")
 
         if qdt_key:
-            upd[qdt_key] = {"relation": []}
-        else:
-            _safe_edit(chat_id, mid, "⚠️ Warning: 'Tổng Quan Đầu Tư' column not found; cannot clear relation.")
+            ok, res = update_page_properties(page_id, {qdt_key: {"relation": []}})
+            if not ok:
+                _safe_edit(chat_id, mid, f"⚠️ Không thể xóa 'Tổng Quan Đầu Tư' relation: {res}")
 
         if ttd_key:
-            upd[ttd_key] = {"relation": []}
-        else:
-            _safe_edit(chat_id, mid, "⚠️ Warning: 'Tổng Thụ Động' column not found; cannot clear relation.")
-
-        # Only call update if there is at least one property to update
-        if upd:
-            ok, res = update_page_properties(page_id, upd)
+            ok, res = update_page_properties(page_id, {ttd_key: {"relation": []}})
             if not ok:
-                _safe_edit(chat_id, mid, f"⚠️ Cập nhật page lỗi: {res}")
+                _safe_edit(chat_id, mid, f"⚠️ Không thể xóa 'Tổng Thụ Động' relation: {res}")
 
-        # Final message (safe edit)
-        _safe_edit(
-            chat_id,
-            mid,
+        # 5) Create Lãi (use existing helper create_lai_page)
+        if ck_val > 0 and LA_NOTION_DATABASE_ID:
+            _safe_edit(chat_id, mid, "💰 Đang tạo Lãi ...")
+            try:
+                lai_id = create_lai_page(chat_id, title, ck_val, page_id)
+                if lai_id:
+                    _safe_edit(chat_id, mid, f"✅ Đã tạo Lãi: {ck_val:,}")
+                else:
+                    _safe_edit(chat_id, mid, f"⚠️ Tạo Lãi thất bại.")
+            except Exception as e:
+                print("WARN create_lai_page:", e)
+                _safe_edit(chat_id, mid, f"⚠️ Lỗi khi tạo Lãi: {e}")
+        else:
+            _safe_edit(chat_id, mid, "ℹ️ Không có Lãi để tạo hoặc LA_NOTION_DATABASE_ID chưa cấu hình.")
+
+        # 6) Final OFF message
+        final_msg = (
             f"✅ Đã OFF {title}\n"
             f"💰 Lãi tạo: {ck_val:,}\n\n"
             f"| Cột | Giá trị |\n"
@@ -772,8 +774,9 @@ def handle_switch_off(chat_id: int, keyword: str):
             f"| Tổng Quan Đầu Tư | clear |\n"
             f"| Tổng Thụ Động | clear |"
         )
+        _safe_edit(chat_id, mid, final_msg)
 
-        # undo log
+        # 7) undo log
         undo_stack.setdefault(str(chat_id), []).append({
             "action": "switch_off",
             "page_id": page_id,
@@ -782,7 +785,7 @@ def handle_switch_off(chat_id: int, keyword: str):
 
     except Exception as e:
         traceback.print_exc()
-        _safe_send(chat_id, f"❌ Lỗi OFF: {e}")
+        _safe_edit(chat_id, None, f"❌ Lỗi OFF: {e}")
 
 def find_calendar_matches(keyword: str):
     """
