@@ -271,8 +271,17 @@ def get_page(page_id: str):
     except Exception as e:
         print("get_page exception:", e)
         return {}
-def now_vn_date():
-    return (datetime.utcnow() + timedelta(hours=7)).date().isoformat()
+
+def today_vn_iso():
+    """
+    ⚠️ CHỈ DÙNG CHO METADATA:
+    - Ngày Đáo
+    - ngày xong
+    - trạng thái
+    ❌ KHÔNG DÙNG cho logic đáo
+    """
+    vn_tz = timezone(timedelta(hours=7))
+    return datetime.now(vn_tz).date().isoformat()
 
 pending_switch_on = {}  # chat_id -> payload
 
@@ -536,7 +545,7 @@ def handle_switch_on(chat_id: int, keyword: str):
             _safe_edit(chat_id, None, "⚠️ Warning: 'trạng thái' column not found on target page.")
 
         if ngay_dao_key:
-            upd[ngay_dao_key] = {"date": {"start": now_vn_date()}}
+            upd[ngay_dao_key] = {"date": {"start": today_vn_iso()}}
         else:
             _safe_edit(chat_id, None, "⚠️ Warning: 'Ngày Đáo' column not found on target page.")
 
@@ -668,26 +677,22 @@ def handle_switch_off(chat_id: int, keyword: str):
     try:
         matches = find_target_matches(keyword)
         if not matches:
-            send_telegram(chat_id, f"❌ Không tìm thấy {keyword}")
+            _safe_send(chat_id, f"❌ Không tìm thấy {keyword}")
             return
 
         page_id, title, _ = matches[0]
         page = get_page(page_id)
-        props = page["properties"]
-
-        # get full page
-        page = get_page(page_id)
         props = page.get("properties", {})
 
-        # resolve property ids
+        # resolve property keys (safe)
         status_key = find_prop_key(props, "trạng thái")
         ngay_xong_key = find_prop_key(props, "ngày xong")
         qdt_key = find_prop_key(props, "Tổng Quan Đầu Tư")
         ttd_key = find_prop_key(props, "Tổng Thụ Động")
 
-        # start message
-        msg = send_telegram(chat_id, f"⏳ Đang OFF {title} ...")
-        mid = msg.get("result", {}).get("message_id")
+        # start message (safe)
+        msg = _safe_send(chat_id, f"⏳ Đang OFF {title} ...")
+        mid = _extract_mid(msg)
 
         # find related calendar pages
         all_pages = query_database_all(NOTION_DATABASE_ID)
@@ -710,11 +715,7 @@ def handle_switch_off(chat_id: int, keyword: str):
             filled = int((i / max(1, total)) * bar_len)
             bar = "█" * filled + "░" * (bar_len - filled)
 
-            edit_telegram_message(
-                chat_id,
-                mid,
-                f"🗑️ {i}/{total} [{bar}]"
-            )
+            _safe_edit(chat_id, mid, f"🗑️ {i}/{total} [{bar}]")
             time.sleep(0.12)
 
         # read CK (lãi)
@@ -730,15 +731,36 @@ def handle_switch_off(chat_id: int, keyword: str):
             except Exception as e:
                 print("WARN create_lai_page:", e)
 
-        # update target page: Done + clear relations
-        update_page_properties(page_id, {
-            status_key: {"select": {"name": "Done"}},
-            ngay_xong_key: {"date": {"start": now_vn_date()}},
-            qdt_key: {"relation": []},
-            ttd_key: {"relation": []},
-        })
+        # Build update payload only with keys that exist
+        upd = {}
+        if status_key:
+            upd[status_key] = {"select": {"name": "Done"}}
+        else:
+            _safe_edit(chat_id, mid, "⚠️ Warning: 'trạng thái' column not found; cannot set Done.")
 
-        edit_telegram_message(
+        if ngay_xong_key:
+            upd[ngay_xong_key] = {"date": {"start": today_vn_iso()}}
+        else:
+            _safe_edit(chat_id, mid, "⚠️ Warning: 'ngày xong' column not found; cannot set date.")
+
+        if qdt_key:
+            upd[qdt_key] = {"relation": []}
+        else:
+            _safe_edit(chat_id, mid, "⚠️ Warning: 'Tổng Quan Đầu Tư' column not found; cannot clear relation.")
+
+        if ttd_key:
+            upd[ttd_key] = {"relation": []}
+        else:
+            _safe_edit(chat_id, mid, "⚠️ Warning: 'Tổng Thụ Động' column not found; cannot clear relation.")
+
+        # Only call update if there is at least one property to update
+        if upd:
+            ok, res = update_page_properties(page_id, upd)
+            if not ok:
+                _safe_edit(chat_id, mid, f"⚠️ Cập nhật page lỗi: {res}")
+
+        # Final message (safe edit)
+        _safe_edit(
             chat_id,
             mid,
             f"✅ Đã OFF {title}\n"
@@ -760,7 +782,7 @@ def handle_switch_off(chat_id: int, keyword: str):
 
     except Exception as e:
         traceback.print_exc()
-        send_telegram(chat_id, f"❌ Lỗi OFF: {e}")
+        _safe_send(chat_id, f"❌ Lỗi OFF: {e}")
 
 def find_calendar_matches(keyword: str):
     """
