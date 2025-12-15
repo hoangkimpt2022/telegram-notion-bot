@@ -1913,21 +1913,24 @@ def handle_incoming_message(chat_id: int, text: str):
         # --- PHÂN TÍCH LỆNH ---
         keyword, count, action = parse_user_command(raw)
         kw = keyword  # giữ lại cho auto-mark
-        if low_raw.endswith(" on"):
-            threading.Thread(
-                target=handle_switch_on,
-                args=(chat_id, kw),
-                daemon=True
-            ).start()
-            return
-
-        if low_raw.endswith(" off"):
-            threading.Thread(
-                target=handle_switch_off,
-                args=(chat_id, kw),
-                daemon=True
-            ).start()
-            return
+        # ===== SWITCH ON / OFF =====
+        parts = low_raw.split()
+        if len(parts) >= 2 and parts[-1] in ("on", "off"):
+            kw = " ".join(parts[:-1])  # ví dụ: "g034"
+            if parts[-1] == "on":
+                threading.Thread(
+                    target=handle_switch_on,
+                    args=(chat_id, kw),
+                    daemon=True
+                ).start()
+                return
+            else:
+                threading.Thread(
+                    target=handle_switch_off,
+                    args=(chat_id, kw),
+                    daemon=True
+                ).start()
+                return
 
         # --- AUTO-MARK MODE ---
         if action == "mark" and count > 0:
