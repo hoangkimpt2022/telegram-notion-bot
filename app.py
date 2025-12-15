@@ -86,7 +86,7 @@ def edit_telegram_message(chat_id, message_id, new_text, parse_mode=None):
     except Exception as e:
         print("edit_telegram_message exception:", e)
         return {}
-        
+
 def _safe_send(chat_id: int, text: str):
     """
     Send Telegram message safely, return message dict or None
@@ -113,6 +113,31 @@ def _safe_edit(chat_id: int, message_id: int | None, text: str):
         edit_telegram_message(chat_id, message_id, text)
     except Exception as e:
         print("WARN _safe_edit:", e)
+# --- Helper: safely extract message_id from Telegram send/edit response
+def _extract_mid(msg):
+    """
+    Trả về message_id (int) nếu có, hoặc None.
+    Hỗ trợ các dạng:
+      - None
+      - dict như Telegram API: {"ok": True, "result": {..., "message_id": 123, ...}}
+      - dict có trực tiếp "message_id"
+    """
+    if not msg:
+        return None
+    try:
+        if isinstance(msg, dict):
+            # Telegram API typical response
+            res = msg.get("result")
+            if isinstance(res, dict):
+                mid = res.get("message_id")
+                if isinstance(mid, int):
+                    return mid
+            # fallback: maybe caller already returned message object
+            if "message_id" in msg and isinstance(msg.get("message_id"), int):
+                return msg.get("message_id")
+        return None
+    except Exception:
+        return None
 
 def start_waiting_animation(chat_id: int, message_id: int, duration: int = 120, interval: float = 2.0, label: str = "đang chờ"):
     """
@@ -504,23 +529,37 @@ def handle_switch_on(chat_id: int, keyword: str):
         mid = _extract_mid(msg)
 
         # update target page once (property ids)
-        upd = {
-            status_key: {"select": {"name": "In progress"}},
-            ngay_dao_key: {"date": {"start": now_vn_date()}},
-        }
-        # try to get relation page ids from env
+        upd = {}
+        if status_key:
+            upd[status_key] = {"select": {"name": "In progress"}}
+        else:
+            _safe_edit(chat_id, None, "⚠️ Warning: 'trạng thái' column not found on target page.")
+
+        if ngay_dao_key:
+            upd[ngay_dao_key] = {"date": {"start": now_vn_date()}}
+        else:
+            _safe_edit(chat_id, None, "⚠️ Warning: 'Ngày Đáo' column not found on target page.")
+
+        # relation keys: qdt_key / ttd_key
         qdt_pid = os.getenv("SWITCH_QDT_PAGE_ID")
+        if qdt_key:
+            if qdt_pid:
+                upd[qdt_key] = {"relation": [{"id": qdt_pid}]}
+            else:
+                upd[qdt_key] = {"relation": []}
+                _safe_edit(chat_id, mid, "⚠️ Warning: SWITCH_QDT_PAGE_ID not set — 'Tổng Quan Đầu Tư' not linked.")
+        else:
+            _safe_edit(chat_id, None, "⚠️ Warning: 'Tổng Quan Đầu Tư' column not found on target page.")
+
         ttd_pid = os.getenv("SWITCH_TTD_PAGE_ID")
-        if qdt_pid:
-            upd[qdt_key] = {"relation": [{"id": qdt_pid}]}
+        if ttd_key:
+            if ttd_pid:
+                upd[ttd_key] = {"relation": [{"id": ttd_pid}]}
+            else:
+                upd[ttd_key] = {"relation": []}
+                _safe_edit(chat_id, mid, "⚠️ Warning: SWITCH_TTD_PAGE_ID not set — 'Tổng Thụ Động' not linked.")
         else:
-            upd[qdt_key] = {"relation": []}
-            _safe_edit(chat_id, mid, "⚠️ Warning: SWITCH_QDT_PAGE_ID not set — 'Tổng Quan Đầu Tư' not linked.")
-        if ttd_pid:
-            upd[ttd_key] = {"relation": [{"id": ttd_pid}]}
-        else:
-            upd[ttd_key] = {"relation": []}
-            _safe_edit(chat_id, mid, "⚠️ Warning: SWITCH_TTD_PAGE_ID not set — 'Tổng Thụ Động' not linked.")
+            _safe_edit(chat_id, None, "⚠️ Warning: 'Tổng Thụ Động' column not found on target page.")
 
         try:
             update_page_properties(page_id, upd)
