@@ -375,10 +375,9 @@ def parse_money_from_text(s: Optional[str]) -> float:
         return 0.0
 
 # ------------- FINDERS & LIST BUILDERS -------------
-def find_target_matches(keyword: str, db_id: str = TARGET_NOTION_DATABASE_ID):
-
-    if not db_id:
-        return []
+def find_target_matches(keyword: str, db_id: str = None):
+    if db_id is None:
+        db_id = TARGET_NOTION_DATABASE_ID
 
     kw = normalize_text(keyword).strip()
 
