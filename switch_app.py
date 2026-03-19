@@ -65,7 +65,9 @@ def handle_switch_on(chat_id: int, keyword: str):
     try:
         msg = send_telegram(chat_id, f"🟢 Đang xử lý ON cho '{keyword}' ...")
         message_id = msg.get("result", {}).get("message_id")
-
+        # ===== DEBUG =====
+        print(f"[DEBUG switch_on] keyword='{keyword}' | find_target_matches={find_target_matches}")
+        # =================
         def update(text):
             if message_id:
                 try:
