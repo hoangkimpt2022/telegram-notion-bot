@@ -388,11 +388,16 @@ def find_target_matches(keyword: str, db_id: str = None):
         return []
 
     kw = normalize_text(keyword).strip()
-    pages = query_database_all(db_id, page_size=MAX_QUERY_PAGE_SIZE)
-    out = []
 
-    is_gcode = bool(re.match(r'^g[0-9]+$', kw))
-    kw_g = normalize_gcode(kw) if is_gcode else None
+    # tách keyword thành tokens
+    kw_tokens = tokenize_title(kw)
+
+    # tìm gcode trong keyword
+    kw_g = None
+    for tk in kw_tokens:
+        if re.match(r'^g[0-9]+$', tk):
+            kw_g = normalize_gcode(tk)
+            break
 
     for p in pages:
         props = p.get("properties", {})
@@ -409,18 +414,21 @@ def find_target_matches(keyword: str, db_id: str = None):
         if title_clean == kw:
             matched = True
 
-        # 2) gcode logic
-        if not matched and is_gcode:
+        # ✅ ƯU TIÊN MATCH GCODE (CHÍNH)
+        if not matched and kw_g:
             for tk in tokens:
                 if normalize_gcode(tk) == kw_g:
                     matched = True
                     break
 
-        # 3) text token logic
-        if not matched and not is_gcode:
-            for tk in tokens:
-                if kw in tk:
-                    matched = True
+        # ✅ MATCH TOKEN (phụ)
+        if not matched:
+            for kw_tk in kw_tokens:
+                for tk in tokens:
+                    if kw_tk in tk:
+                        matched = True
+                        break
+                if matched:
                     break
 
         # 4) fallback: title startswith keyword-
