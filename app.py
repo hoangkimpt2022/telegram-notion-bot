@@ -378,6 +378,7 @@ def parse_money_from_text(s: Optional[str]) -> float:
 def find_target_matches(keyword: str, db_id: str = None):
     if db_id is None:
         db_id = TARGET_NOTION_DATABASE_ID
+
     # ===== DEBUG - XÓA SAU KHI FIX =====
     print(f"[DEBUG] keyword='{keyword}' | db_id='{db_id}' | token_set={bool(NOTION_TOKEN)}")
     pages = query_database_all(db_id, page_size=MAX_QUERY_PAGE_SIZE)
@@ -387,6 +388,7 @@ def find_target_matches(keyword: str, db_id: str = None):
         title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
         print(f"[DEBUG] page title: '{title}'")
     # ===== END DEBUG =====
+
     kw = normalize_text(keyword).strip()
 
     # LẤY TOÀN BỘ PAGE TRONG DATABASE
@@ -2015,6 +2017,7 @@ switch_app.init_switch_deps(
     query_database_all=query_database_all,
     undo_stack=undo_stack,
     NOTION_DATABASE_ID=NOTION_DATABASE_ID,
+    TARGET_NOTION_DATABASE_ID=TARGET_NOTION_DATABASE_ID
     find_prop_key=find_prop_key,
 )
 
