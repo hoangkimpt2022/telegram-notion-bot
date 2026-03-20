@@ -375,20 +375,12 @@ def parse_money_from_text(s: Optional[str]) -> float:
         return 0.0
 
 # ------------- FINDERS & LIST BUILDERS -------------
+   
 def find_target_matches(keyword: str, db_id: str = None):
     if db_id is None:
         db_id = TARGET_NOTION_DATABASE_ID
-    import requests as _req
-    _req.post(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        json={"chat_id": TELEGRAM_CHAT_ID, "text":
-              f"[DEBUG] kw={keyword} | db_id={db_id} | token={'OK' if NOTION_TOKEN else 'EMPTY'}"},
-        timeout=5
-    )
     if not db_id:
         return []
-
-
 
     kw = normalize_text(keyword).strip()
 
