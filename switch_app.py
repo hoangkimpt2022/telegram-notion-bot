@@ -18,7 +18,6 @@ create_lai_page = None
 query_database_all = None
 undo_stack = None
 NOTION_DATABASE_ID = None
-TARGET_NOTION_DATABASE_ID = None 
 find_prop_key = None
 
 VN_TZ = timezone(timedelta(hours=7))
@@ -44,7 +43,6 @@ def init_switch_deps(**kwargs):
     query_database_all = kwargs.get("query_database_all")
     undo_stack = kwargs.get("undo_stack")
     NOTION_DATABASE_ID = kwargs.get("NOTION_DATABASE_ID")
-    TARGET_NOTION_DATABASE_ID = kwargs.get("TARGET_NOTION_DATABASE_ID")
     find_prop_key = kwargs.get("find_prop_key")
 
 
@@ -67,9 +65,7 @@ def handle_switch_on(chat_id: int, keyword: str):
     try:
         msg = send_telegram(chat_id, f"🟢 Đang xử lý ON cho '{keyword}' ...")
         message_id = msg.get("result", {}).get("message_id")
-        # ===== DEBUG =====
-        print(f"[DEBUG switch_on] keyword='{keyword}' | find_target_matches={find_target_matches}")
-        # =================
+
         def update(text):
             if message_id:
                 try:
@@ -80,8 +76,8 @@ def handle_switch_on(chat_id: int, keyword: str):
             send_telegram(chat_id, text)
 
         # ---- BƯỚC 1: TÌM TARGET ----
-        update(f"🔍 Đang tìm '{keyword}'  ...")
-        matches = find_target_matches(keyword, db_id=TARGET_NOTION_DATABASE_ID)
+        update(f"🔍 Đang tìm '{keyword}' trong TARGET DB ...")
+        matches = find_target_matches(keyword)
 
         if not matches:
             update(f"❌ Không tìm thấy '{keyword}' trong TARGET DB.")
