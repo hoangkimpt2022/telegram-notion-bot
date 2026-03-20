@@ -375,28 +375,28 @@ def parse_money_from_text(s: Optional[str]) -> float:
         return 0.0
 
 # ------------- FINDERS & LIST BUILDERS -------------
-   
 def find_target_matches(keyword: str, db_id: str = None):
-    if db_id is None:
+    if not db_id:
         db_id = TARGET_NOTION_DATABASE_ID
+    """
+    Tìm khách trong TARGET DB:
+    - Nếu keyword dạng Gxxx (g024, g24…) → so theo token normalize_gcode.
+    - Nếu keyword là text (tam) → match theo token.
+    - Tên kiểu G024-tam14-xxxx → đều match.
+    """
     if not db_id:
         return []
 
     kw = normalize_text(keyword).strip()
-
-    # LẤY TOÀN BỘ PAGE TRONG DATABASE
     pages = query_database_all(db_id, page_size=MAX_QUERY_PAGE_SIZE)
-
     out = []
 
-    # chuẩn hóa gcode
     is_gcode = bool(re.match(r'^g[0-9]+$', kw))
     kw_g = normalize_gcode(kw) if is_gcode else None
 
     for p in pages:
         props = p.get("properties", {})
         title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
-
         if not title:
             continue
 
@@ -405,25 +405,25 @@ def find_target_matches(keyword: str, db_id: str = None):
 
         matched = False
 
-        # exact
+        # 1) exact match
         if title_clean == kw:
             matched = True
 
-        # match gcode
-        if not matched and kw_g:
+        # 2) gcode logic
+        if not matched and is_gcode:
             for tk in tokens:
                 if normalize_gcode(tk) == kw_g:
                     matched = True
                     break
 
-        # match text
-        if not matched:
+        # 3) text token logic
+        if not matched and not is_gcode:
             for tk in tokens:
                 if kw in tk:
                     matched = True
                     break
 
-        # fallback
+        # 4) fallback: title startswith keyword-
         if not matched and title_clean.startswith(kw + "-"):
             matched = True
 
@@ -2010,7 +2010,6 @@ switch_app.init_switch_deps(
     query_database_all=query_database_all,
     undo_stack=undo_stack,
     NOTION_DATABASE_ID=NOTION_DATABASE_ID,
-    TARGET_NOTION_DATABASE_ID=TARGET_NOTION_DATABASE_ID
     find_prop_key=find_prop_key,
 )
 
