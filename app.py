@@ -377,17 +377,19 @@ def parse_money_from_text(s: Optional[str]) -> float:
 # ------------- FINDERS & LIST BUILDERS -------------
 def find_target_matches(keyword: str, db_id: str = None):
     if db_id is None:
-        db_id = TARGET_NOTION_DATABASE_ID
+        db_id = TARGET_NOTION_DATABASE_# DEBUG — bot tự báo thẳng vào Telegram
+    if send_telegram:
+        send_telegram_fn = send_telegram  # tránh nhầm tên
+    # dùng requests trực tiếp để debug
+    import requests as _req
+    _req.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": 
+              f"[DEBUG] kw={keyword}\ndb_id={db_id}\ntoken={'OK' if NOTION_TOKEN else 'EMPTY'}"}
+    )
 
-    # ===== DEBUG - XÓA SAU KHI FIX =====
-    print(f"[DEBUG] keyword='{keyword}' | db_id='{db_id}' | token_set={bool(NOTION_TOKEN)}")
-    pages = query_database_all(db_id, page_size=MAX_QUERY_PAGE_SIZE)
-    print(f"[DEBUG] total pages found: {len(pages)}")
-    for p in pages:
-        props = p.get("properties", {})
-        title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
-        print(f"[DEBUG] page title: '{title}'")
-    # ===== END DEBUG =====
+    if not db_id:
+        return []
 
     kw = normalize_text(keyword).strip()
 
