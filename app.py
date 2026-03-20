@@ -378,12 +378,6 @@ def parse_money_from_text(s: Optional[str]) -> float:
 def find_target_matches(keyword: str, db_id: str = None):
     if not db_id:
         db_id = TARGET_NOTION_DATABASE_ID
-    """
-    Tìm khách trong TARGET DB:
-    - Nếu keyword dạng Gxxx (g024, g24…) → so theo token normalize_gcode.
-    - Nếu keyword là text (tam) → match theo token.
-    - Tên kiểu G024-tam14-xxxx → đều match.
-    """
     if not db_id:
         return []
 
