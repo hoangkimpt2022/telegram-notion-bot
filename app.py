@@ -424,10 +424,11 @@ def _match_keyword_to_title(kw: str, title: str) -> bool:
     return False
 
 
-def find_target_matches(keyword: str, db_id: str = None):
+def find_target_matches(keyword: str, db_id: str = None, _pages: list = None):
     """
     Tìm khách trong TARGET DB.
-    FIX #5: debug log chi tiết.
+    page_size=10 vì TARGET DB có nhiều formula/rollup → page_size lớn sẽ timeout.
+    _pages: truyền sẵn data đã query (tránh query lại).
     """
     if db_id is None:
         db_id = TARGET_NOTION_DATABASE_ID
@@ -441,7 +442,10 @@ def find_target_matches(keyword: str, db_id: str = None):
         print("[find_target_matches] keyword empty after normalize")
         return []
 
-    pages = query_database_all(db_id, page_size=MAX_QUERY_PAGE_SIZE)
+    if _pages is not None:
+        pages = _pages
+    else:
+        pages = query_database_all(db_id, page_size=10)
     print(f"[find_target_matches] keyword='{kw}' pages_from_db={len(pages)}")
 
     out = []
@@ -1894,8 +1898,9 @@ def handle_incoming_message(chat_id: int, text: str):
                 f"NOTION_TOKEN: {'✅ set' if NOTION_TOKEN else '❌ TRỐNG'}",
             ]
             # Test query TARGET DB
+            pages = []
             try:
-                pages = query_database_all(TARGET_NOTION_DATABASE_ID, page_size=5)
+                pages = query_database_all(TARGET_NOTION_DATABASE_ID, page_size=10)
                 lines.append(f"\n📦 Query TARGET DB: {len(pages)} pages (top 5)")
                 for i, p in enumerate(pages[:5]):
                     props = p.get("properties", {})
@@ -1904,9 +1909,9 @@ def handle_incoming_message(chat_id: int, text: str):
             except Exception as e:
                 lines.append(f"\n❌ Query TARGET DB lỗi: {e}")
 
-            # Test matching
+            # Test matching — reuse pages đã query, không query lại
             try:
-                matches_debug = find_target_matches(debug_kw)
+                matches_debug = find_target_matches(debug_kw, _pages=pages)
                 lines.append(f"\n🔍 find_target_matches('{debug_kw}'): {len(matches_debug)} kết quả")
                 for pid, title, props in matches_debug[:5]:
                     lines.append(f"  → {title}")
