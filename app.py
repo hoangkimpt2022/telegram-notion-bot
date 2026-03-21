@@ -14,6 +14,9 @@
 # 9. Tách hàm find_children_by_relation → tìm ngày theo relation thay vì tên
 
 import os
+os.environ["PYTHONUNBUFFERED"] = "1"  # Fix: print() hiện ngay trên Render logs
+import sys
+sys.stdout.reconfigure(line_buffering=True)
 import re
 import math
 import json
@@ -1867,6 +1870,40 @@ def handle_incoming_message(chat_id: int, text: str):
             return
 
         low = raw.lower()
+
+        # ===== DEBUG COMMAND =====
+        if low.startswith("debug "):
+            debug_kw = raw[6:].strip()
+            lines = [
+                f"🔧 DEBUG cho '{debug_kw}'",
+                f"━━━━━━━━━━━━━━━━━━",
+                f"TARGET_DB_ID: {'✅ ' + TARGET_NOTION_DATABASE_ID[:8] + '...' if TARGET_NOTION_DATABASE_ID else '❌ TRỐNG'}",
+                f"CALENDAR_DB_ID: {'✅ ' + NOTION_DATABASE_ID[:8] + '...' if NOTION_DATABASE_ID else '❌ TRỐNG'}",
+                f"LA_DB_ID: {'✅ ' + LA_NOTION_DATABASE_ID[:8] + '...' if LA_NOTION_DATABASE_ID else '❌ TRỐNG'}",
+                f"NOTION_TOKEN: {'✅ set' if NOTION_TOKEN else '❌ TRỐNG'}",
+            ]
+            # Test query TARGET DB
+            try:
+                pages = query_database_all(TARGET_NOTION_DATABASE_ID, page_size=5)
+                lines.append(f"\n📦 Query TARGET DB: {len(pages)} pages (top 5)")
+                for i, p in enumerate(pages[:5]):
+                    props = p.get("properties", {})
+                    title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or "(no title)"
+                    lines.append(f"  {i+1}. {title}")
+            except Exception as e:
+                lines.append(f"\n❌ Query TARGET DB lỗi: {e}")
+
+            # Test matching
+            try:
+                matches_debug = find_target_matches(debug_kw)
+                lines.append(f"\n🔍 find_target_matches('{debug_kw}'): {len(matches_debug)} kết quả")
+                for pid, title, props in matches_debug[:5]:
+                    lines.append(f"  → {title}")
+            except Exception as e:
+                lines.append(f"\n❌ find_target_matches lỗi: {e}")
+
+            send_telegram(chat_id, "\n".join(lines))
+            return
 
         # Route pending DAO
         _pending = pending_confirm.get(str(chat_id))
