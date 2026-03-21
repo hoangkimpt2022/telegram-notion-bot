@@ -40,6 +40,7 @@ NOTION_HEADERS = {
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
 TARGET_NOTION_DATABASE_ID = os.getenv("TARGET_NOTION_DATABASE_ID", "")
 LA_NOTION_DATABASE_ID = os.getenv("LA_NOTION_DATABASE_ID", "")
+TONG_THU_DONG_G_PAGE_ID = os.getenv("TONG_THU_DONG_G_PAGE_ID", "")  # Page ID của "G" trong relation Tổng Thụ Động
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -461,13 +462,22 @@ def find_target_matches(keyword: str, db_id: str = None, _pages: list = None):
     return out
 
 
-def find_calendar_matches(keyword: str):
+def find_calendar_data(keyword: str):
+    """
+    Query CALENDAR DB 1 LẦN DUY NHẤT, trả về:
+      (unchecked_matches, checked_count, unchecked_count)
+    - unchecked_matches: list[(pid, title, date_iso, props)] — chưa tích, sorted by date
+    - checked_count: số page đã tích
+    - unchecked_count: số page chưa tích
+    """
     if not NOTION_DATABASE_ID:
-        return []
+        return [], 0, 0
 
     kw = normalize_text(keyword)
     pages = query_database_all(NOTION_DATABASE_ID, page_size=MAX_QUERY_PAGE_SIZE)
-    matches = []
+    unchecked_matches = []
+    checked_count = 0
+    unchecked_count = 0
 
     for p in pages:
         props = p.get("properties", {})
@@ -483,20 +493,32 @@ def find_calendar_matches(keyword: str):
             or find_prop_key(props, "Sent")
             or find_prop_key(props, "Status")
         )
-        if cb_key and props.get(cb_key, {}).get("checkbox"):
-            continue
+        is_checked = bool(cb_key and props.get(cb_key, {}).get("checkbox"))
 
-        date_iso = None
-        date_key = find_prop_key(props, "Ngày Góp")
-        if date_key:
-            df = props.get(date_key, {}).get("date")
-            if df:
-                date_iso = df.get("start")
+        if is_checked:
+            checked_count += 1
+        else:
+            unchecked_count += 1
+            date_iso = None
+            date_key = find_prop_key(props, "Ngày Góp")
+            if date_key:
+                df = props.get(date_key, {}).get("date")
+                if df:
+                    date_iso = df.get("start")
+            unchecked_matches.append((p.get("id"), title, date_iso, props))
 
-        matches.append((p.get("id"), title, date_iso, props))
+    unchecked_matches.sort(key=lambda x: (x[2] is None, x[2] or ""))
+    return unchecked_matches, checked_count, unchecked_count
 
-    matches.sort(key=lambda x: (x[2] is None, x[2] or ""))
+
+# Backward compat wrappers (cho code cũ gọi)
+def find_calendar_matches(keyword: str):
+    matches, _, _ = find_calendar_data(keyword)
     return matches
+
+def count_checked_unchecked(keyword: str) -> Tuple[int, int]:
+    _, checked, unchecked = find_calendar_data(keyword)
+    return checked, unchecked
 
 
 def find_matching_all_pages_in_db(database_id: str, keyword: str, limit: int = 2000):
@@ -612,31 +634,6 @@ def dao_preview_text_from_props(title: str, props: dict):
 # =====================================================================
 #  ACTIONS: MARK / UNDO
 # =====================================================================
-def count_checked_unchecked(keyword: str) -> Tuple[int, int]:
-    results = query_database_all(NOTION_DATABASE_ID, page_size=MAX_QUERY_PAGE_SIZE)
-    checked = 0
-    unchecked = 0
-    kw_clean = normalize_text(keyword)
-
-    for p in results:
-        props = p.get("properties", {})
-        title = extract_prop_text(props, "Name") or ""
-        title_clean = normalize_text(title)
-
-        parts = title_clean.split('-')
-        if kw_clean in [pt.strip() for pt in parts] or title_clean == kw_clean:
-            key = find_prop_key(props, "Đã Góp") or find_prop_key(props, "Sent") or find_prop_key(props, "Status")
-            checked_flag = False
-            if key and props.get(key, {}).get("type") == "checkbox":
-                checked_flag = bool(props.get(key, {}).get("checkbox"))
-            if checked_flag:
-                checked += 1
-            else:
-                unchecked += 1
-
-    return checked, unchecked
-
-
 def mark_pages_by_indices(chat_id: str, keyword: str,
                           matches: List[Tuple[str, str, Optional[str], Dict[str, Any]]],
                           indices: List[int]) -> Dict[str, Any]:
@@ -1367,8 +1364,11 @@ def process_pending_selection(chat_id: str, raw: str):
             if succeeded:
                 undo_stack.setdefault(str(chat_id), []).append({"action": "mark", "pages": [p[0] for p in succeeded]})
 
-            checked, unchecked = count_checked_unchecked(keyword)
-            send_telegram(chat_id, f"💴 {keyword}\n\n📊 Đã góp: {checked}\n🟡 Chưa góp: {unchecked}")
+            # Tính count từ data cũ — không query lại
+            n_ok = len(succeeded)
+            old_checked = data.get("checked", 0)
+            old_unchecked = data.get("unchecked", 0)
+            send_telegram(chat_id, f"💴 {keyword}\n\n📊 Đã góp: {old_checked + n_ok}\n🟡 Chưa góp: {old_unchecked - n_ok}")
             pending_confirm.pop(key, None)
             return
 
@@ -1603,6 +1603,26 @@ def execute_switch_on(chat_id: int, target_id: str, title: str, props: dict):
             update(f"⚠️ Lỗi cập nhật TARGET (bỏ qua): {e}")
         time.sleep(0.3)
 
+        # Cập nhật relation Tổng Thụ Động → G
+        old_ttd_relation = []
+        if TONG_THU_DONG_G_PAGE_ID:
+            try:
+                ttd_key = find_prop_key(props, "Tổng Thụ Động") or find_prop_key(props, "tổng thụ động")
+                if ttd_key:
+                    # Lưu giá trị cũ để undo
+                    old_rel = props.get(ttd_key, {}).get("relation", [])
+                    old_ttd_relation = [r.get("id") for r in old_rel if r.get("id")]
+                    # Set relation → G
+                    ok, res = update_page_properties(target_id, {
+                        ttd_key: {"relation": [{"id": TONG_THU_DONG_G_PAGE_ID}]}
+                    })
+                    if ok:
+                        update("✅ Tổng Thụ Động → G")
+                    else:
+                        update(f"⚠️ Lỗi set Tổng Thụ Động: {res}")
+            except Exception as e:
+                update(f"⚠️ Lỗi Tổng Thụ Động (bỏ qua): {e}")
+
         # Tạo các ngày
         update(f"🛠️ Đang tạo {take_days} ngày trong CALENDAR DB ...")
         time.sleep(0.3)
@@ -1657,7 +1677,8 @@ def execute_switch_on(chat_id: int, target_id: str, title: str, props: dict):
             "title": title,
             "created_pages": created_pages,
             "old_trangthai": extract_prop_text(props, "trạng thái") or "",
-            "old_ngaydao": extract_prop_text(props, "Ngày Đáo") or ""
+            "old_ngaydao": extract_prop_text(props, "Ngày Đáo") or "",
+            "old_ttd_relation": old_ttd_relation,
         })
 
     except Exception as e:
@@ -1739,6 +1760,23 @@ def execute_switch_off(chat_id: int, target_id: str, title: str, props: dict, ch
             update(f"⚠️ Lỗi cập nhật TARGET (bỏ qua): {e}")
         time.sleep(0.3)
 
+        # Xóa relation Tổng Thụ Động
+        old_ttd_relation = []
+        try:
+            ttd_key = find_prop_key(props, "Tổng Thụ Động") or find_prop_key(props, "tổng thụ động")
+            if ttd_key:
+                old_rel = props.get(ttd_key, {}).get("relation", [])
+                old_ttd_relation = [r.get("id") for r in old_rel if r.get("id")]
+                ok, res = update_page_properties(target_id, {
+                    ttd_key: {"relation": []}
+                })
+                if ok:
+                    update("✅ Tổng Thụ Động → bỏ G")
+                else:
+                    update(f"⚠️ Lỗi xóa Tổng Thụ Động: {res}")
+        except Exception as e:
+            update(f"⚠️ Lỗi Tổng Thụ Động (bỏ qua): {e}")
+
         update(f"🎉 Hoàn tất OFF cho: {title}")
 
         # Ghi undo log
@@ -1749,7 +1787,8 @@ def execute_switch_off(chat_id: int, target_id: str, title: str, props: dict, ch
             "archived_pages": children,
             "lai_page": lai_page_id,
             "old_trangthai": extract_prop_text(props, "trạng thái") or "",
-            "old_ngayxong": extract_prop_text(props, "ngày xong") or ""
+            "old_ngayxong": extract_prop_text(props, "ngày xong") or "",
+            "old_ttd_relation": old_ttd_relation,
         })
 
     except Exception as e:
@@ -1790,6 +1829,15 @@ def _undo_switch_on(chat_id: int, log: dict):
         restore_props["Ngày Đáo"] = {"date": {"start": old_nd}}
     if restore_props and target_id:
         update_page_properties(target_id, restore_props)
+
+    # Restore Tổng Thụ Động
+    old_ttd = log.get("old_ttd_relation", [])
+    if target_id:
+        try:
+            ttd_rel = [{"id": rid} for rid in old_ttd] if old_ttd else []
+            update_page_properties(target_id, {"Tổng Thụ Động": {"relation": ttd_rel}})
+        except Exception as e:
+            print(f"⚠️ Undo TTD lỗi: {e}")
 
     final_msg = f"✅ Đã hoàn tác ON cho: {log.get('title')}"
     if message_id:
@@ -1835,6 +1883,15 @@ def _undo_switch_off(chat_id: int, log: dict):
         restore_props["ngày xong"] = {"date": {"start": old_nx}}
     if restore_props and target_id:
         update_page_properties(target_id, restore_props)
+
+    # Restore Tổng Thụ Động
+    old_ttd = log.get("old_ttd_relation", [])
+    if target_id:
+        try:
+            ttd_rel = [{"id": rid} for rid in old_ttd] if old_ttd else []
+            update_page_properties(target_id, {"Tổng Thụ Động": {"relation": ttd_rel}})
+        except Exception as e:
+            print(f"⚠️ Undo TTD lỗi: {e}")
 
     final_msg = f"✅ Đã hoàn tác OFF cho: {log.get('title')}"
     if message_id:
@@ -2003,7 +2060,7 @@ def handle_incoming_message(chat_id: int, text: str):
         # --- AUTO-MARK ---
         if action == "mark" and count > 0:
             send_telegram(chat_id, f"🎏 Đang auto tích🔄...  {kw} ")
-            matches = find_calendar_matches(kw)
+            matches, checked, unchecked = find_calendar_data(kw)
             if not matches:
                 send_telegram(chat_id, f"Không tìm thấy mục nào cho '{kw}'.")
                 return
@@ -2022,8 +2079,11 @@ def handle_incoming_message(chat_id: int, text: str):
             if res.get("failed"):
                 send_telegram(chat_id, f"⚠️ Có {len(res['failed'])} mục đánh dấu lỗi.")
 
-            checked, unchecked = count_checked_unchecked(kw)
-            send_telegram(chat_id, f"💴 {kw}\n\n ✅ Đã góp: {checked}\n🟡 Chưa góp: {unchecked}")
+            # Tính count từ data cũ — không query lại
+            n_ok = len(res.get("succeeded", []))
+            checked_new = checked + n_ok
+            unchecked_new = unchecked - n_ok
+            send_telegram(chat_id, f"💴 {kw}\n\n ✅ Đã góp: {checked_new}\n🟡 Chưa góp: {unchecked_new}")
             return
 
         # --- UNDO ---
@@ -2160,9 +2220,8 @@ def handle_incoming_message(chat_id: int, text: str):
             return
 
         # --- INTERACTIVE MARK MODE ---
-        matches = find_calendar_matches(kw)
         send_telegram(chat_id, f"🔍 Đang tìm ... 🔄 {kw} ")
-        checked, unchecked = count_checked_unchecked(kw)
+        matches, checked, unchecked = find_calendar_data(kw)
 
         if not matches or unchecked == 0:
             msg_text = (
@@ -2189,6 +2248,8 @@ def handle_incoming_message(chat_id: int, text: str):
             "type": "mark",
             "keyword": kw,
             "matches": matches,
+            "checked": checked,
+            "unchecked": unchecked,
             "expires": time.time() + WAIT_CONFIRM,
             "timer_message_id": timer_message_id
         }
