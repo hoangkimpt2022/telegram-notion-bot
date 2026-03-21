@@ -1953,6 +1953,7 @@ def handle_incoming_message(chat_id: int, text: str):
                 f"LA_DB_ID: {'✅ ' + LA_NOTION_DATABASE_ID[:16] + '...' if LA_NOTION_DATABASE_ID else '❌ TRỐNG'}",
                 f"SAME? {'⚠️ CẢ HAI GIỐNG NHAU!' if TARGET_NOTION_DATABASE_ID == NOTION_DATABASE_ID else '✅ Khác nhau'}",
                 f"NOTION_TOKEN: {'✅ set' if NOTION_TOKEN else '❌ TRỐNG'}",
+                f"TTD_G_PAGE: {'✅ ' + TONG_THU_DONG_G_PAGE_ID[:16] + '...' if TONG_THU_DONG_G_PAGE_ID else '❌ TRỐNG (set TONG_THU_DONG_G_PAGE_ID)'}",
             ]
             # Test query TARGET DB
             pages = []
@@ -1976,6 +1977,97 @@ def handle_incoming_message(chat_id: int, text: str):
                 lines.append(f"\n❌ find_target_matches lỗi: {e}")
 
             send_telegram(chat_id, "\n".join(lines))
+            return
+
+        # ===== DEBUG TTD COMMAND =====
+        if low.startswith("debug ttd "):
+            debug_kw = raw[10:].strip()
+            send_telegram(chat_id, f"🔧 Đang chẩn đoán Tổng Thụ Động cho '{debug_kw}' ...")
+
+            lines = [f"🔧 DEBUG TTD cho '{debug_kw}'", "━━━━━━━━━━━━━━━━━━"]
+
+            # 1. Check env var
+            g_id = TONG_THU_DONG_G_PAGE_ID
+            lines.append(f"ENV TONG_THU_DONG_G_PAGE_ID: {'✅ ' + g_id if g_id else '❌ TRỐNG'}")
+
+            # 2. Find target page
+            try:
+                pages = query_database_all(TARGET_NOTION_DATABASE_ID, page_size=10)
+                matches = find_target_matches(debug_kw, _pages=pages)
+                if not matches:
+                    lines.append(f"❌ Không tìm thấy '{debug_kw}' trong TARGET DB")
+                    send_telegram(chat_id, "\n".join(lines))
+                    return
+
+                target_id, title, props = matches[0]
+                lines.append(f"✅ Target: {title} (id={target_id[:12]}...)")
+
+                # 3. Scan ALL property names containing "thu dong" or "thụ động"
+                lines.append(f"\n📋 Tất cả property keys:")
+                for k in sorted(props.keys()):
+                    ptype = props[k].get("type", "?")
+                    lines.append(f"  [{ptype}] {k}")
+
+                # 4. Find TTD property specifically
+                ttd_key = find_prop_key(props, "Tổng Thụ Động") or find_prop_key(props, "tổng thụ động")
+                lines.append(f"\n🔍 find_prop_key('Tổng Thụ Động'): {ttd_key or '❌ KHÔNG TÌM THẤY'}")
+
+                if ttd_key:
+                    ttd_prop = props.get(ttd_key, {})
+                    ttd_type = ttd_prop.get("type", "?")
+                    lines.append(f"  type: {ttd_type}")
+                    lines.append(f"  raw value: {json.dumps(ttd_prop, ensure_ascii=False, default=str)[:300]}")
+
+                    # 5. Thử GET page trực tiếp để xem full relation config
+                    try:
+                        r = requests.get(
+                            f"https://api.notion.com/v1/pages/{target_id}/properties/{ttd_key}",
+                            headers=NOTION_HEADERS, timeout=15
+                        )
+                        lines.append(f"\n📡 GET property API: status={r.status_code}")
+                        lines.append(f"  response: {r.text[:300]}")
+                    except Exception as e:
+                        lines.append(f"  GET lỗi: {e}")
+
+                    # 6. Thử PATCH set relation
+                    if g_id:
+                        try:
+                            patch_body = {ttd_key: {"relation": [{"id": g_id}]}}
+                            lines.append(f"\n🔨 Thử PATCH: {json.dumps(patch_body, ensure_ascii=False)[:200]}")
+                            ok, res = update_page_properties(target_id, patch_body)
+                            if ok:
+                                lines.append("  ✅ PATCH thành công!")
+                            else:
+                                lines.append(f"  ❌ PATCH thất bại: {json.dumps(res, ensure_ascii=False, default=str)[:300]}")
+                        except Exception as e:
+                            lines.append(f"  ❌ PATCH exception: {e}")
+
+                        # 7. Thử với format có dấu gạch ngang
+                        g_id_fmt = g_id.replace("-", "")
+                        if len(g_id_fmt) == 32:
+                            g_id_dashed = f"{g_id_fmt[:8]}-{g_id_fmt[8:12]}-{g_id_fmt[12:16]}-{g_id_fmt[16:20]}-{g_id_fmt[20:]}"
+                            if g_id_dashed != g_id:
+                                try:
+                                    patch_body2 = {ttd_key: {"relation": [{"id": g_id_dashed}]}}
+                                    lines.append(f"\n🔨 Thử PATCH (dashed): {g_id_dashed[:20]}...")
+                                    ok2, res2 = update_page_properties(target_id, patch_body2)
+                                    if ok2:
+                                        lines.append("  ✅ PATCH (dashed) thành công!")
+                                    else:
+                                        lines.append(f"  ❌ PATCH (dashed) thất bại: {json.dumps(res2, ensure_ascii=False, default=str)[:300]}")
+                                except Exception as e:
+                                    lines.append(f"  ❌ PATCH (dashed) exception: {e}")
+
+            except Exception as e:
+                lines.append(f"❌ Lỗi: {e}")
+                traceback.print_exc()
+
+            # Chia nhỏ nếu quá dài
+            msg_text = "\n".join(lines)
+            if len(msg_text) > 3500:
+                send_long_text(chat_id, msg_text)
+            else:
+                send_telegram(chat_id, msg_text)
             return
 
         # Route pending DAO
