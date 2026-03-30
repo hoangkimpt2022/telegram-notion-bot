@@ -1,7 +1,5 @@
-flask
 requests
-APScheduler
-pytz
-gunicorn
-python-dateutil
+python-dotenv
+schedule
+flask
 
