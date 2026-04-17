@@ -579,9 +579,15 @@ def find_children_by_relation(target_page_id: str) -> List[str]:
 # =====================================================================
 def dao_preview_text_from_props(title: str, props: dict):
     try:
+        # ========== KHÚC TRÊN: LẤY DỮ LIỆU (giữ nguyên + bổ sung) ==========
         dao_text = extract_prop_text(props, "Đáo/thối") or extract_prop_text(props, "Đáo") or ""
         total_val = parse_money_from_text(dao_text) or 0
         per_day = _num(props, "G ngày")
+
+        # 🆕 BỔ SUNG: lấy thêm thông tin hiển thị chi tiết
+        total_money = _num(props, "tiền")           # Tổng tiền gốc (ví dụ 10,000)
+        total_days = int(_num(props, "tổng ngày g")) # Tổng số ngày phải góp (ví dụ 50)
+        checked, unchecked = count_checked_unchecked(title)  # Đã góp / Chưa góp
 
         raw_days = extract_prop_text(props, "ngày trước")
         try:
@@ -589,22 +595,33 @@ def dao_preview_text_from_props(title: str, props: dict):
         except Exception:
             days_before = 0
 
+        # ========== KHÚC GIỮA: CHẶN 🔴 (giữ nguyên) ==========
         if "🔴" in dao_text:
             return False, f"🔔 Chưa thể đáo cho 🔴: {title} ."
 
+        # ========== KHÚC DƯỚI: XỬ LÝ ✅ (UPGRADE) ==========
         if "✅" in dao_text:
+            # 🆕 Dòng header chi tiết — hiển thị chung cho cả 2 nhánh
+            header_line = (
+                f"{title} : với số tiền {int(total_money):,} "
+                f"ngày {int(per_day):,} góp {total_days} ngày "
+                f"Còn {unchecked} ngày chưa góp"
+            )
+
+            # --- NHÁNH KHÔNG LẤY TRƯỚC ---
             if not days_before or days_before <= 0:
                 tomorrow = (datetime.now(VN_TZ)).date() + timedelta(days=1)
                 restart = tomorrow.strftime("%d-%m-%Y")
                 msg = (
-                    f"🔔 đáo lại cho: {title} - Tổng CK: ✅ {int(total_val)}\n\n"
+                    f"🔔 {header_line}\n\n"
                     f"💴 Không Lấy trước\n"
-                    f"📆 ngày mai Bắt đầu góp lại \n"
-                    f"{restart}"
+                    f"🏛️ Tổng CK: ✅ {int(total_val):,}\n"
+                    f"📆 Bắt đầu góp lại ngày mai ({restart})"
                 )
                 props["ONLY_LAI"] = True
                 return True, msg
 
+            # --- NHÁNH CÓ LẤY TRƯỚC ---
             take_days = int(days_before)
             total_pre = int(per_day * take_days) if per_day else 0
             start = (datetime.now(VN_TZ)).date() + timedelta(days=1)
@@ -612,16 +629,18 @@ def dao_preview_text_from_props(title: str, props: dict):
             restart_date = (start + timedelta(days=take_days)).strftime("%d-%m-%Y")
 
             lines = [
-                f"🔔 Đáo lại cho: {title} ",
-                f"💴 Lấy trước: {take_days} ngày {int(per_day)} là {total_pre}",
-                f"   ( từ ngày mai):",
+                f"🔔 {header_line}",
+                "",
+                f"💴 Lấy trước: {take_days} ngày {int(per_day):,} là {total_pre:,} ( từ ngày mai):",
             ]
             for idx, d in enumerate(date_list, start=1):
-                lines.append(f"{idx}. {d}")
-            lines.append(f"\n🏛️ Tổng CK: ✅ {int(total_val)}")
+                lines.append(f"   {idx}. {d}")
+            lines.append("")
+            lines.append(f"🔔 Đáo lại khách sẽ nhận : ✅ {int(total_val):,}")
             lines.append(f"📆 Đến ngày {restart_date} bắt đầu góp lại")
             return True, "\n".join(lines)
 
+        # ========== KHÚC CUỐI: FALLBACK (giữ nguyên) ==========
         msg = f"🔔 đáo lại cho: {title} - Tổng CK: {int(total_val)}\n\nKhông Lấy trước\n\nGửi /ok để chỉ tạo Lãi."
         props["ONLY_LAI"] = True
         return True, msg
@@ -629,7 +648,6 @@ def dao_preview_text_from_props(title: str, props: dict):
     except Exception as e:
         print("dao_preview_text_from_props error:", e)
         return False, f"Preview error: {e}"
-
 
 # =====================================================================
 #  ACTIONS: MARK / UNDO
