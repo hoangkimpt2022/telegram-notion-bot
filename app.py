@@ -188,7 +188,7 @@ def _notion_patch(url: str, json_body: dict, attempts: int = 3, timeout: int = 1
     return False, str(last_exc)
 
 
-def query_database_all(database_id: str, page_size: int = MAX_QUERY_PAGE_SIZE, _retries: int = 1) -> List[Dict[str, Any]]:
+def query_database_all(database_id: str, page_size: int = MAX_QUERY_PAGE_SIZE, _retries: int = 3) -> List[Dict[str, Any]]:
     """Query all pages with retry + increased timeout."""
     if not NOTION_TOKEN:
         print("[query_database_all] SKIP — NOTION_TOKEN is EMPTY")
@@ -198,38 +198,41 @@ def query_database_all(database_id: str, page_size: int = MAX_QUERY_PAGE_SIZE, _
         return []
 
     db_short = database_id[:16]
+    url = f"https://api.notion.com/v1/databases/{database_id}/query"
+    # Notion cho phép page_size tối đa 100, dùng 100 để ít request nhất
+    actual_page_size = min(page_size, 100)
 
-    for attempt in range(1, _retries + 1):
-        results: List[Dict[str, Any]] = []
-        try:
-            url = f"https://api.notion.com/v1/databases/{database_id}/query"
-            payload: dict = {"page_size": page_size}
-            r = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=30)
-            if r.status_code != 200:
-                print(f"[query_database_all] FAILED db={db_short}... status={r.status_code} attempt={attempt}")
-                if r.status_code >= 500 and attempt < _retries:
-                    time.sleep(2 * attempt)
-                    continue
-                return []
-            data = r.json()
-            results.extend(data.get("results", []))
-            while data.get("has_more"):
-                payload["start_cursor"] = data.get("next_cursor")
-                r = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=30)
-                if r.status_code != 200:
-                    print(f"[query_database_all] pagination FAILED status={r.status_code}")
+    results: List[Dict[str, Any]] = []
+    cursor = None
+
+    while True:
+        payload: dict = {"page_size": actual_page_size}
+        if cursor:
+            payload["start_cursor"] = cursor
+
+        for attempt in range(1, _retries + 1):
+            try:
+                r = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=45)
+                if r.status_code == 200:
                     break
-                data = r.json()
-                results.extend(data.get("results", []))
-            print(f"[query_database_all] OK db={db_short}... total_pages={len(results)}")
-            return results
-        except Exception as e:
-            print(f"[query_database_all] EXCEPTION attempt={attempt}/{_retries} db={db_short}... {e}")
-            if attempt < _retries:
+                print(f"[query_database_all] status={r.status_code} attempt={attempt} db={db_short}")
                 time.sleep(2 * attempt)
-                continue
-            return []
-    return []
+            except Exception as e:
+                print(f"[query_database_all] EXCEPTION attempt={attempt} db={db_short}: {e}")
+                time.sleep(2 * attempt)
+        else:
+            print(f"[query_database_all] GIVE UP after {_retries} attempts db={db_short}, got {len(results)} so far")
+            return results
+
+        data = r.json()
+        results.extend(data.get("results", []))
+
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+
+    print(f"[query_database_all] OK db={db_short}... total_pages={len(results)}")
+    return results
 
 
 def create_page_in_db(database_id: str, properties: Dict[str, Any]) -> Tuple[bool, Any]:
