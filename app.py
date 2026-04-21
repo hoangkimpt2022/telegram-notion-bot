@@ -464,32 +464,45 @@ def find_target_matches(keyword: str, db_id: str = None, _pages: list = None):
     print(f"[find_target_matches] matched={len(out)} for kw='{kw}'")
     return out
 
-
 def find_calendar_data(keyword: str):
-    """
-    Query CALENDAR DB 1 LẦN DUY NHẤT, trả về:
-      (unchecked_matches, checked_count, unchecked_count)
-    - unchecked_matches: list[(pid, title, date_iso, props)] — chưa tích, sorted by date
-    - checked_count: số page đã tích
-    - unchecked_count: số page chưa tích
-    """
     if not NOTION_DATABASE_ID:
         return [], 0, 0
 
-    kw = normalize_text(keyword)
-    pages = query_database_all(NOTION_DATABASE_ID, page_size=MAX_QUERY_PAGE_SIZE)
+    # Bước 1: tìm target_id từ TARGET DB
+    matches = find_target_matches(keyword)
+    if not matches:
+        return [], 0, 0
+    target_id = matches[0][0]
+
+    # Bước 2: query CALENDAR DB theo relation
+    url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
+    payload = {
+        "page_size": 100,
+        "filter": {
+            "property": "Lịch G",
+            "relation": {"contains": target_id}
+        }
+    }
+
+    pages = []
+    while True:
+        r = requests.post(url, headers=NOTION_HEADERS, json=payload, timeout=45)
+        if r.status_code != 200:
+            print(f"[find_calendar_data] FAILED status={r.status_code}")
+            break
+        data = r.json()
+        pages.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        payload["start_cursor"] = data.get("next_cursor")
+
     unchecked_matches = []
     checked_count = 0
     unchecked_count = 0
 
     for p in pages:
         props = p.get("properties", {})
-        title = extract_prop_text(props, "Name") or extract_prop_text(props, "Title") or ""
-        if not title:
-            continue
-
-        if not _match_keyword_to_title(kw, title):
-            continue
+        title = extract_prop_text(props, "Name") or ""
 
         cb_key = (
             find_prop_key(props, "Đã Góp")
@@ -512,7 +525,6 @@ def find_calendar_data(keyword: str):
 
     unchecked_matches.sort(key=lambda x: (x[2] is None, x[2] or ""))
     return unchecked_matches, checked_count, unchecked_count
-
 
 # Backward compat wrappers (cho code cũ gọi)
 def find_calendar_matches(keyword: str):
