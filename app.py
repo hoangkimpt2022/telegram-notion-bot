@@ -188,7 +188,7 @@ def _notion_patch(url: str, json_body: dict, attempts: int = 3, timeout: int = 1
     return False, str(last_exc)
 
 
-def query_database_all(database_id: str, page_size: int = MAX_QUERY_PAGE_SIZE, _retries: int = 3) -> List[Dict[str, Any]]:
+def query_database_all(database_id: str, page_size: int = MAX_QUERY_PAGE_SIZE, _retries: int = 5) -> List[Dict[str, Any]]:
     """Query all pages with retry + increased timeout."""
     if not NOTION_TOKEN:
         print("[query_database_all] SKIP — NOTION_TOKEN is EMPTY")
