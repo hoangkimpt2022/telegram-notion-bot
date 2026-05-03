@@ -28,6 +28,8 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+load_dotenv("/root/app/.env")
 
 # ------------- CONFIG -------------
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "")
