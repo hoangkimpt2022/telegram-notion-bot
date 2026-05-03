@@ -2457,6 +2457,7 @@ def telegram_webhook():
 def run_polling():
     api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
     offset = 0
+    print(f"[POLLING] Bắt đầu... Token: {TELEGRAM_TOKEN[:20] if TELEGRAM_TOKEN else 'TRỐNG'}")
     while True:
         try:
             resp = requests.get(
@@ -2464,12 +2465,15 @@ def run_polling():
                 params={"timeout": 30, "offset": offset},
                 timeout=40,
             )
-            updates = resp.json().get("result", [])
+            data = resp.json()
+            print(f"[POLLING] Updates: {len(data.get('result', []))}")
+            updates = data.get("result", [])
             for upd in updates:
                 offset = upd["update_id"] + 1
                 msg = upd.get("message", {})
                 text = (msg.get("text") or "").strip()
                 cid = msg.get("chat", {}).get("id")
+                print(f"[POLLING] Tin nhắn từ {cid}: {text}")
                 if cid and text:
                     threading.Thread(
                         target=handle_incoming_message,
@@ -2477,7 +2481,7 @@ def run_polling():
                         daemon=True
                     ).start()
         except Exception as e:
-            print(f"Polling lỗi: {e}")
+            print(f"[POLLING] Lỗi: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
