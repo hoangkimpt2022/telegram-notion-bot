@@ -2485,7 +2485,5 @@ def run_polling():
             time.sleep(5)
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    # Chạy polling Telegram ngầm
-    threading.Thread(target=run_polling, daemon=True).start()
-    app.run(host="0.0.0.0", port=port)
+    print("🚀 app-vps khởi động polling...")
+    run_polling()
