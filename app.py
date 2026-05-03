@@ -2449,32 +2449,37 @@ def telegram_webhook():
 
     return jsonify({"ok": True})
 
-
-def auto_ping_render():
-    RENDER_URL = os.getenv("RENDER_URL", "https://telegram-notion-bot-tpm2.onrender.com")
-    while True:
-        now_vn = datetime.now(VN_TZ)
-        hour = now_vn.hour
-        if 9 <= hour < 24:
-            try:
-                r = requests.get(RENDER_URL, timeout=10)
-                print(f"[{now_vn:%H:%M:%S}] 🔄 Ping Render: {r.status_code}")
-            except Exception as e:
-                print(f"[{now_vn:%H:%M:%S}] ⚠️ Ping lỗi: {e}")
-        else:
-            print(f"[{now_vn:%H:%M:%S}] 🌙 Ngoài giờ làm việc — không ping.")
-        time.sleep(300)
-
-
 # =====================================================================
 #  RUN
 # =====================================================================
+def run_polling():
+    api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+    offset = 0
+    while True:
+        try:
+            resp = requests.get(
+                f"{api}/getUpdates",
+                params={"timeout": 30, "offset": offset},
+                timeout=40,
+            )
+            updates = resp.json().get("result", [])
+            for upd in updates:
+                offset = upd["update_id"] + 1
+                msg = upd.get("message", {})
+                text = (msg.get("text") or "").strip()
+                cid = msg.get("chat", {}).get("id")
+                if cid and text:
+                    threading.Thread(
+                        target=handle_incoming_message,
+                        args=(cid, text),
+                        daemon=True
+                    ).start()
+        except Exception as e:
+            print(f"Polling lỗi: {e}")
+            time.sleep(5)
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    print("Launching app.py (consolidated) on port", port)
-    print("NOTION_DATABASE_ID:", NOTION_DATABASE_ID[:8] + "..." if NOTION_DATABASE_ID else "(none)")
-    print("TARGET_NOTION_DATABASE_ID:", TARGET_NOTION_DATABASE_ID[:8] + "..." if TARGET_NOTION_DATABASE_ID else "(none)")
-    print("LA_NOTION_DATABASE_ID:", LA_NOTION_DATABASE_ID[:8] + "..." if LA_NOTION_DATABASE_ID else "(none)")
-    print("TELEGRAM_TOKEN set?:", bool(TELEGRAM_TOKEN))
-    threading.Thread(target=auto_ping_render, daemon=True).start()
+    # Chạy polling Telegram ngầm
+    threading.Thread(target=run_polling, daemon=True).start()
     app.run(host="0.0.0.0", port=port)
